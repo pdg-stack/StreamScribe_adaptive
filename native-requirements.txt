@@ -1,0 +1,6 @@
+PyQt6>=6.11
+pyaudiowpatch>=0.2.12
+pycaw>=20260921
+websockets>=17
+numpy>=2.5
+scipy>=1.18
