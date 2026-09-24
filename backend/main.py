@@ -22,7 +22,7 @@ import asyncio
 import json
 import time
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 
 from backend.config import DEFAULT_DST_LANG
 from backend.transcription.engine import AdaptiveEngine
@@ -45,42 +45,48 @@ async def ws_transcribe(websocket: WebSocket) -> None:
     dst_lang = DEFAULT_DST_LANG
     was_speaking = False
 
-    try:
-        while True:
-            message = await websocket.receive()
+    while True:
+        message = await websocket.receive()
 
-            if message.get("bytes") is not None:
-                for event in segmenter.push(message["bytes"]):
-                    # transcribe/translate are CPU-bound and synchronous
-                    # (model downloads, faster-whisper, ctranslate2) -- run
-                    # them off the event loop so the server stays responsive
-                    # (health checks, other connections) while they run.
-                    result = await asyncio.to_thread(engine.transcribe_segment, event.audio)
-                    translated = await asyncio.to_thread(translate, result.text, result.detected_lang, dst_lang)
-                    await websocket.send_text(json.dumps({
-                        "type": event.kind,
-                        "text": result.text,
-                        "detected_lang": result.detected_lang,
-                        "translated_text": translated,
-                        "model_tier": result.model_tier,
-                        "cpu_status": result.cpu_status,
-                        "timestamp": time.time(),
-                    }))
-                    was_speaking = True
+        # The raw receive() API delivers a disconnect as an ordinary
+        # message (type "websocket.disconnect") rather than raising --
+        # calling receive() again afterwards is what raises, and the
+        # exact exception class for that has changed across
+        # starlette versions (WebSocketDisconnect vs
+        # WebSocketDisconnected), so checking the type explicitly here
+        # is the version-independent way to exit cleanly.
+        if message["type"] == "websocket.disconnect":
+            break
 
-                if was_speaking and not segmenter.in_speech:
-                    await websocket.send_text(json.dumps({
-                        "type": "idle",
-                        "model_tier": engine.model_tier,
-                        "cpu_status": "off",
-                        "timestamp": time.time(),
-                    }))
-                    was_speaking = False
+        if message.get("bytes") is not None:
+            for event in segmenter.push(message["bytes"]):
+                # transcribe/translate are CPU-bound and synchronous
+                # (model downloads, faster-whisper, ctranslate2) -- run
+                # them off the event loop so the server stays responsive
+                # (health checks, other connections) while they run.
+                result = await asyncio.to_thread(engine.transcribe_segment, event.audio)
+                translated = await asyncio.to_thread(translate, result.text, result.detected_lang, dst_lang)
+                await websocket.send_text(json.dumps({
+                    "type": event.kind,
+                    "text": result.text,
+                    "detected_lang": result.detected_lang,
+                    "translated_text": translated,
+                    "model_tier": result.model_tier,
+                    "cpu_status": result.cpu_status,
+                    "timestamp": time.time(),
+                }))
+                was_speaking = True
 
-            elif message.get("text") is not None:
-                control = json.loads(message["text"])
-                if control.get("type") == "set_dst_lang":
-                    dst_lang = control.get("lang", dst_lang)
+            if was_speaking and not segmenter.in_speech:
+                await websocket.send_text(json.dumps({
+                    "type": "idle",
+                    "model_tier": engine.model_tier,
+                    "cpu_status": "off",
+                    "timestamp": time.time(),
+                }))
+                was_speaking = False
 
-    except WebSocketDisconnect:
-        pass
+        elif message.get("text") is not None:
+            control = json.loads(message["text"])
+            if control.get("type") == "set_dst_lang":
+                dst_lang = control.get("lang", dst_lang)
