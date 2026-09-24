@@ -83,17 +83,22 @@ class AdaptiveEngine:
             self._rtf_samples.clear()
         return "green"
 
-    def transcribe_segment(self, audio: np.ndarray, sample_rate: int = 16000) -> TranscriptionResult:
+    def transcribe_segment(
+        self, audio: np.ndarray, sample_rate: int = 16000, language: str | None = None
+    ) -> TranscriptionResult:
         """audio: mono float32 PCM in [-1, 1]. Runs the currently active
         tier's model, measures RTF, and updates the tier/status for the
         *next* segment -- this segment's own result reports the tier that
-        actually produced it."""
+        actually produced it. `language=None` auto-detects (the default,
+        source-language dropdown's "Auto Detect" option); passing an
+        ISO 639-1 code forces that language instead of detecting it, and
+        `detected_lang` on the result will just echo it back."""
         ran_tier = self.model_tier
         model = get_model(ran_tier, self.device)
         duration = len(audio) / sample_rate
 
         start = time.monotonic()
-        segments, info = model.transcribe(audio, language=None, beam_size=BEAM_SIZE)
+        segments, info = model.transcribe(audio, language=language, beam_size=BEAM_SIZE)
         text = " ".join(s.text.strip() for s in segments).strip()
         elapsed = time.monotonic() - start
 

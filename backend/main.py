@@ -14,6 +14,7 @@ CPU-strain light off without guessing from a timeout.)
 
 Control messages in (JSON text frames):
     {"type": "set_dst_lang", "lang": "<iso-639-1>"}
+    {"type": "set_src_lang", "lang": "auto"|"<iso-639-1>"}
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ async def ws_transcribe(websocket: WebSocket) -> None:
     engine = AdaptiveEngine()
     segmenter = VadSegmenter()
     dst_lang = DEFAULT_DST_LANG
+    src_lang: str | None = None  # None = auto-detect
     was_speaking = False
 
     while True:
@@ -64,7 +66,7 @@ async def ws_transcribe(websocket: WebSocket) -> None:
                 # (model downloads, faster-whisper, ctranslate2) -- run
                 # them off the event loop so the server stays responsive
                 # (health checks, other connections) while they run.
-                result = await asyncio.to_thread(engine.transcribe_segment, event.audio)
+                result = await asyncio.to_thread(engine.transcribe_segment, event.audio, 16000, src_lang)
                 translated = await asyncio.to_thread(translate, result.text, result.detected_lang, dst_lang)
                 await websocket.send_text(json.dumps({
                     "type": event.kind,
@@ -90,3 +92,6 @@ async def ws_transcribe(websocket: WebSocket) -> None:
             control = json.loads(message["text"])
             if control.get("type") == "set_dst_lang":
                 dst_lang = control.get("lang", dst_lang)
+            elif control.get("type") == "set_src_lang":
+                lang = control.get("lang", "auto")
+                src_lang = None if lang == "auto" else lang
