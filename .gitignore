@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Models / caches
+*.pt
+*.bin
+models_cache/
+
+# User data
+user_prefs.json
+*.log
+
+# Env
+.env
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
