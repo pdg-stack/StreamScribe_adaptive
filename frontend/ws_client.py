@@ -50,6 +50,21 @@ class WsClient:
     def set_src_lang(self, lang: str) -> None:
         self._control_queue.put({"type": "set_src_lang", "lang": lang})
 
+    def set_engine(self, engine: str) -> None:
+        self._control_queue.put({"type": "set_engine", "engine": engine})
+
+    def set_tier(self, tier: str) -> None:
+        self._control_queue.put({"type": "set_tier", "tier": tier})
+
+    def set_acceptable_latency(self, seconds: float) -> None:
+        self._control_queue.put({"type": "set_acceptable_latency", "seconds": seconds})
+
+    def start_modal_setup(self) -> None:
+        self._control_queue.put({"type": "start_modal_setup"})
+
+    def stop_modal(self) -> None:
+        self._control_queue.put({"type": "stop_modal"})
+
     def _run(self) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)

@@ -51,13 +51,32 @@ DEFAULT_DEST_LANGUAGE = "en"  # mirrors Settings.dest_language's default
 
 
 class OverlayWindow(QWidget):
-    def __init__(self, settings: Settings, on_src_lang_change, on_dest_lang_change, on_close) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        on_src_lang_change,
+        on_dest_lang_change,
+        on_close,
+        on_engine_change,
+        on_tier_change,
+        on_latency_change,
+        on_modal_setup_requested,
+        on_modal_stop_requested,
+    ) -> None:
         super().__init__()
         self.settings = settings
         self._on_src_lang_change = on_src_lang_change
         self._on_dest_lang_change = on_dest_lang_change
         self._on_close = on_close
+        self._settings_actions = {
+            "on_engine_change": on_engine_change,
+            "on_tier_change": on_tier_change,
+            "on_latency_change": on_latency_change,
+            "on_modal_setup_requested": on_modal_setup_requested,
+            "on_modal_stop_requested": on_modal_stop_requested,
+        }
         self._settings_panel: SettingsDialog | None = None
+        self.modal_status = "terminated"
         self._last_partial_update = 0.0
         self._last_event: dict | None = None
         self._drag_offset: QPoint | None = None
@@ -78,8 +97,10 @@ class OverlayWindow(QWidget):
 
         root.addWidget(self._build_toolbar())
         root.addWidget(self._build_caption_panel(), stretch=1)
+        root.addWidget(self._build_advanced_pane())
 
         self._apply_style()
+        self._update_advanced_pane_visibility()
 
     # -- toolbar -----------------------------------------------------
     def _build_toolbar(self) -> QFrame:
@@ -166,9 +187,39 @@ class OverlayWindow(QWidget):
 
         return panel
 
+    def _build_advanced_pane(self) -> QFrame:
+        # Diagnostic detail hidden from the default view (see plan's
+        # Advanced mode): queue length, the acceptable-delay setting,
+        # active model/tier, and local vs. cloud -- toggled in Settings.
+        pane = QFrame()
+        pane.setObjectName("advancedPane")
+        layout = QHBoxLayout(pane)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(14)
+
+        self.advanced_queue_label = QLabel("")
+        self.advanced_latency_label = QLabel("")
+        self.advanced_model_label = QLabel("")
+        self.advanced_source_label = QLabel("")
+        for w in (self.advanced_queue_label, self.advanced_latency_label, self.advanced_model_label, self.advanced_source_label):
+            w.setObjectName("advancedLabel")
+            layout.addWidget(w)
+        layout.addStretch(1)
+
+        self._advanced_pane = pane
+        self._update_advanced_pane()
+        return pane
+
     # -- public API, called from main.py -------------------------------
     def handle_event(self, event: dict) -> None:
         kind = event.get("type")
+        if kind == "modal_setup_status":
+            self.modal_status = event.get("status", "terminated")
+            if self._settings_panel is not None:
+                self._settings_panel.set_modal_status(self.modal_status)
+            self._update_advanced_pane()
+            return
+
         if kind == "idle":
             self._set_status("off")
             return
@@ -189,6 +240,7 @@ class OverlayWindow(QWidget):
 
         self._last_event = event
         self._render_caption()
+        self._update_advanced_pane(queue_length=event.get("queue_length"))
 
     def set_source_app(self, name: str | None) -> None:
         self.source_app_label.setText(f"Source: {name}" if name else "")
@@ -196,10 +248,24 @@ class OverlayWindow(QWidget):
     def apply_settings(self, settings: Settings) -> None:
         self.settings = settings
         self._apply_style()
+        self._update_advanced_pane_visibility()
+        self._update_advanced_pane()
 
     # -- internals -------------------------------------------------------
     def _is_auto_selected(self) -> bool:
         return self.source_combo.currentData() == AUTO_CODE
+
+    def _update_advanced_pane_visibility(self) -> None:
+        self._advanced_pane.setVisible(self.settings.advanced_mode)
+
+    def _update_advanced_pane(self, queue_length: int | None = None) -> None:
+        if queue_length is not None:
+            self.advanced_queue_label.setText(f"Queue: {queue_length}")
+        self.advanced_latency_label.setText(f"Acceptable delay: {self.settings.acceptable_latency_s:g}s")
+        tier = self.tier_label.text() or self.settings.tier
+        self.advanced_model_label.setText(f"Model: {self.settings.engine} ({tier})")
+        is_cloud = self.modal_status in ("ready", "alive")
+        self.advanced_source_label.setText("Cloud (Modal)" if is_cloud else "Local")
 
     def _render_caption(self) -> None:
         if self._last_event is None:
@@ -238,7 +304,13 @@ class OverlayWindow(QWidget):
             self._settings_panel.close()
             return
 
-        panel = SettingsDialog(self.settings, on_change=self.apply_settings, parent=self)
+        panel = SettingsDialog(
+            self.settings,
+            on_change=self.apply_settings,
+            actions=self._settings_actions,
+            modal_status=self.modal_status,
+            parent=self,
+        )
         panel.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         panel.destroyed.connect(self._on_settings_panel_closed)
         panel.adjustSize()
@@ -318,7 +390,11 @@ class OverlayWindow(QWidget):
                 background-color: rgba(255, 255, 255, 20);
                 border-radius: 12px;
             }}
-            #tierLabel, #sourceAppLabel {{
+            #advancedPane {{
+                background-color: rgba(0, 0, 0, {min(alpha + 20, 255)});
+                border-radius: 10px;
+            }}
+            #tierLabel, #sourceAppLabel, #advancedLabel {{
                 color: #cccccc;
                 font-size: 11px;
             }}

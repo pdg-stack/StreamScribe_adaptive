@@ -24,6 +24,11 @@ class Settings:
     dest_language: str = "en"
     window_x: int | None = None
     window_y: int | None = None
+    engine: str = "faster-whisper"  # "faster-whisper" | "parakeet"
+    tier: str = "auto"  # "auto" | "small" | "base" | "tiny" -- faster-whisper only
+    acceptable_latency_s: float = 1.0  # 1-20s, see plan
+    advanced_mode: bool = False
+    inference_mode: str = "local"  # "local" | "modal"
 
     @classmethod
     def load(cls) -> "Settings":

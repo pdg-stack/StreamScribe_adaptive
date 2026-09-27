@@ -57,12 +57,21 @@ def main() -> None:
         on_src_lang_change=on_src_lang_change,
         on_dest_lang_change=on_dest_lang_change,
         on_close=app.quit,
+        on_engine_change=ws_client.set_engine,
+        on_tier_change=ws_client.set_tier,
+        on_latency_change=ws_client.set_acceptable_latency,
+        on_modal_setup_requested=ws_client.start_modal_setup,
+        on_modal_stop_requested=ws_client.stop_modal,
     )
     bridge.event_received.connect(overlay.handle_event)
     overlay.show()
 
     ws_client.set_src_lang(settings.src_language)
     ws_client.set_dst_lang(settings.dest_language)
+    ws_client.set_engine(settings.engine)
+    if settings.engine == "faster-whisper":
+        ws_client.set_tier(settings.tier)
+    ws_client.set_acceptable_latency(settings.acceptable_latency_s)
     ws_client.start()
 
     capture = LoopbackCapture(on_audio=ws_client.send_audio)
