@@ -19,9 +19,17 @@ more audio off the socket, and so backlog can be measured/preempted.
 Control messages in (JSON text frames):
     {"type": "set_dst_lang", "lang": "<iso-639-1>"}
     {"type": "set_src_lang", "lang": "auto"|"<iso-639-1>"}
-    {"type": "set_engine", "engine": "faster-whisper"|"parakeet"}
+    {"type": "set_engine", "engine": "faster-whisper"|"parakeet"}  ("modal" is
+        entered via start_modal_setup below, not set_engine directly)
     {"type": "set_tier", "tier": "auto"|"small"|"base"|"tiny"}  (faster-whisper only)
     {"type": "set_acceptable_latency", "seconds": float}
+    {"type": "start_modal_setup"}
+    {"type": "stop_modal"}
+
+Modal status events out (see transcription/modal_engine.py):
+    {"type": "modal_setup_status",
+     "status": "deploying"|"warming up"|"ready"|"alive"|"terminated",
+     "timestamp": float}
 """
 
 from __future__ import annotations
@@ -34,10 +42,13 @@ from fastapi import FastAPI, WebSocket
 
 from backend.config import DEFAULT_ACCEPTABLE_LATENCY_S, DEFAULT_DST_LANG, DEFAULT_ENGINE, DEFAULT_TIER_MODE
 from backend.transcription.engine import AdaptiveEngine
+from backend.transcription.modal_engine import ModalEngine
 from backend.transcription.parakeet_engine import ParakeetEngine
 from backend.transcription.segment_queue import SegmentQueue
 from backend.transcription.vad_segmenter import VadSegmenter
 from backend.translation.translator import translate
+
+MODAL_HEARTBEAT_INTERVAL_S = 30
 
 app = FastAPI(title="StreamScribe_adaptive backend")
 
@@ -56,6 +67,41 @@ class ConnectionState:
         self.src_lang: str | None = None  # None = auto-detect
         self.acceptable_latency = DEFAULT_ACCEPTABLE_LATENCY_S
         self.engine_name = DEFAULT_ENGINE
+
+
+async def _send_modal_status(websocket: WebSocket, send_lock: asyncio.Lock, status: str) -> None:
+    async with send_lock:
+        await websocket.send_text(json.dumps({
+            "type": "modal_setup_status",
+            "status": status,
+            "timestamp": time.time(),
+        }))
+
+
+async def _modal_heartbeat(websocket: WebSocket, engines: dict, state: ConnectionState, send_lock: asyncio.Lock) -> None:
+    """Runs for as long as this connection lives; only actually sends
+    anything while Modal is the active, live engine -- exits quietly once
+    it's been stopped or switched away from, rather than looping forever
+    doing nothing."""
+    modal_engine = engines["modal"]
+    while state.engine_name == "modal" and modal_engine.is_active:
+        await asyncio.sleep(MODAL_HEARTBEAT_INTERVAL_S)
+        if state.engine_name == "modal" and modal_engine.is_active:
+            await _send_modal_status(websocket, send_lock, "alive")
+
+
+async def _handle_modal_setup(websocket: WebSocket, engines: dict, state: ConnectionState, send_lock: asyncio.Lock) -> None:
+    loop = asyncio.get_running_loop()
+
+    def on_status(status: str) -> None:
+        asyncio.run_coroutine_threadsafe(_send_modal_status(websocket, send_lock, status), loop)
+
+    try:
+        await asyncio.to_thread(engines["modal"].deploy_and_warm_up, on_status)
+        state.engine_name = "modal"
+        asyncio.create_task(_modal_heartbeat(websocket, engines, state, send_lock))
+    except Exception:
+        await _send_modal_status(websocket, send_lock, "terminated")
 
 
 async def _receiver(websocket: WebSocket, segmenter: VadSegmenter, queue: SegmentQueue, state: ConnectionState, send_lock: asyncio.Lock, engines: dict) -> None:
@@ -104,8 +150,15 @@ async def _receiver(websocket: WebSocket, segmenter: VadSegmenter, queue: Segmen
                 engines["faster-whisper"].set_tier_mode(control.get("tier", "auto"))
             elif control_type == "set_engine":
                 requested = control.get("engine", DEFAULT_ENGINE)
-                if requested in engines:
+                if requested in ("faster-whisper", "parakeet"):
                     state.engine_name = requested
+            elif control_type == "start_modal_setup":
+                asyncio.create_task(_handle_modal_setup(websocket, engines, state, send_lock))
+            elif control_type == "stop_modal":
+                engines["modal"].stop()
+                if state.engine_name == "modal":
+                    state.engine_name = DEFAULT_ENGINE
+                await _send_modal_status(websocket, send_lock, "terminated")
 
 
 async def _processor(websocket: WebSocket, engines: dict, queue: SegmentQueue, state: ConnectionState, send_lock: asyncio.Lock) -> None:
@@ -142,6 +195,7 @@ async def ws_transcribe(websocket: WebSocket) -> None:
     engines = {
         "faster-whisper": AdaptiveEngine(tier_mode=DEFAULT_TIER_MODE),
         "parakeet": ParakeetEngine(),
+        "modal": ModalEngine(),
     }
     segmenter = VadSegmenter()
     queue = SegmentQueue()
@@ -155,3 +209,7 @@ async def ws_transcribe(websocket: WebSocket) -> None:
         await receiver_task
     finally:
         processor_task.cancel()
+        # Belt-and-suspenders: if the connection drops without an explicit
+        # stop_modal (e.g. the app crashes or loses network), don't leave
+        # a billed Modal container running past this session.
+        engines["modal"].stop()
