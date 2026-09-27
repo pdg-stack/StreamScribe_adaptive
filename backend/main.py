@@ -19,7 +19,8 @@ more audio off the socket, and so backlog can be measured/preempted.
 Control messages in (JSON text frames):
     {"type": "set_dst_lang", "lang": "<iso-639-1>"}
     {"type": "set_src_lang", "lang": "auto"|"<iso-639-1>"}
-    {"type": "set_tier", "tier": "auto"|"small"|"base"|"tiny"}
+    {"type": "set_engine", "engine": "faster-whisper"|"parakeet"}
+    {"type": "set_tier", "tier": "auto"|"small"|"base"|"tiny"}  (faster-whisper only)
     {"type": "set_acceptable_latency", "seconds": float}
 """
 
@@ -31,8 +32,9 @@ import time
 
 from fastapi import FastAPI, WebSocket
 
-from backend.config import DEFAULT_ACCEPTABLE_LATENCY_S, DEFAULT_DST_LANG, DEFAULT_TIER_MODE
+from backend.config import DEFAULT_ACCEPTABLE_LATENCY_S, DEFAULT_DST_LANG, DEFAULT_ENGINE, DEFAULT_TIER_MODE
 from backend.transcription.engine import AdaptiveEngine
+from backend.transcription.parakeet_engine import ParakeetEngine
 from backend.transcription.segment_queue import SegmentQueue
 from backend.transcription.vad_segmenter import VadSegmenter
 from backend.translation.translator import translate
@@ -53,9 +55,10 @@ class ConnectionState:
         self.dst_lang = DEFAULT_DST_LANG
         self.src_lang: str | None = None  # None = auto-detect
         self.acceptable_latency = DEFAULT_ACCEPTABLE_LATENCY_S
+        self.engine_name = DEFAULT_ENGINE
 
 
-async def _receiver(websocket: WebSocket, segmenter: VadSegmenter, queue: SegmentQueue, state: ConnectionState, send_lock: asyncio.Lock, engine: AdaptiveEngine) -> None:
+async def _receiver(websocket: WebSocket, segmenter: VadSegmenter, queue: SegmentQueue, state: ConnectionState, send_lock: asyncio.Lock, engines: dict) -> None:
     was_speaking = False
 
     while True:
@@ -80,7 +83,7 @@ async def _receiver(websocket: WebSocket, segmenter: VadSegmenter, queue: Segmen
                 async with send_lock:
                     await websocket.send_text(json.dumps({
                         "type": "idle",
-                        "model_tier": engine.model_tier,
+                        "model_tier": engines[state.engine_name].model_tier,
                         "cpu_status": "off",
                         "queue_length": len(queue),
                         "timestamp": time.time(),
@@ -98,13 +101,18 @@ async def _receiver(websocket: WebSocket, segmenter: VadSegmenter, queue: Segmen
             elif control_type == "set_acceptable_latency":
                 state.acceptable_latency = float(control.get("seconds", state.acceptable_latency))
             elif control_type == "set_tier":
-                engine.set_tier_mode(control.get("tier", "auto"))
+                engines["faster-whisper"].set_tier_mode(control.get("tier", "auto"))
+            elif control_type == "set_engine":
+                requested = control.get("engine", DEFAULT_ENGINE)
+                if requested in engines:
+                    state.engine_name = requested
 
 
-async def _processor(websocket: WebSocket, engine: AdaptiveEngine, queue: SegmentQueue, state: ConnectionState, send_lock: asyncio.Lock) -> None:
+async def _processor(websocket: WebSocket, engines: dict, queue: SegmentQueue, state: ConnectionState, send_lock: asyncio.Lock) -> None:
     while True:
         queue.preempt_if_needed(state.acceptable_latency)
         item = await queue.pop()
+        engine = engines[state.engine_name]
 
         start = time.monotonic()
         result = await asyncio.to_thread(engine.transcribe_segment, item.event.audio, 16000, state.src_lang)
@@ -131,14 +139,17 @@ async def _processor(websocket: WebSocket, engine: AdaptiveEngine, queue: Segmen
 async def ws_transcribe(websocket: WebSocket) -> None:
     await websocket.accept()
 
-    engine = AdaptiveEngine(tier_mode=DEFAULT_TIER_MODE)
+    engines = {
+        "faster-whisper": AdaptiveEngine(tier_mode=DEFAULT_TIER_MODE),
+        "parakeet": ParakeetEngine(),
+    }
     segmenter = VadSegmenter()
     queue = SegmentQueue()
     state = ConnectionState()
     send_lock = asyncio.Lock()
 
-    receiver_task = asyncio.create_task(_receiver(websocket, segmenter, queue, state, send_lock, engine))
-    processor_task = asyncio.create_task(_processor(websocket, engine, queue, state, send_lock))
+    receiver_task = asyncio.create_task(_receiver(websocket, segmenter, queue, state, send_lock, engines))
+    processor_task = asyncio.create_task(_processor(websocket, engines, queue, state, send_lock))
 
     try:
         await receiver_task

@@ -29,6 +29,14 @@ NLLB_MODEL_DIR = "/root/.cache/streamscribe/nllb-200-distilled-600M-ct2"
 DEFAULT_DST_LANG = "en"
 DEFAULT_SRC_LANG = "auto"
 DEFAULT_TIER_MODE = "auto"
+DEFAULT_ENGINE = "faster-whisper"
+
+# Parakeet TDT 0.6B v3, via sherpa-onnx's quantized ONNX export -- local
+# only, never via Modal (see plan). Covers Russian/Spanish/English/
+# Italian/Portuguese; the frontend's language dropdown limits selectable
+# languages to what's actually available per engine.
+PARAKEET_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2"
+PARAKEET_CACHE_DIR = "/root/.cache/streamscribe/parakeet"
 
 # Queue preemption: if the predicted wait for the newest queued segment
 # (queue depth ahead of it * recent average processing time) exceeds this
