@@ -27,3 +27,13 @@ STRAIN_WINDOW = 4  # consecutive segments averaged before switching tiers
 NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"
 NLLB_MODEL_DIR = "/root/.cache/streamscribe/nllb-200-distilled-600M-ct2"
 DEFAULT_DST_LANG = "en"
+DEFAULT_SRC_LANG = "auto"
+DEFAULT_TIER_MODE = "auto"
+
+# Queue preemption: if the predicted wait for the newest queued segment
+# (queue depth ahead of it * recent average processing time) exceeds this
+# multiple of the user's acceptable-latency setting, drop everything queued
+# except the newest segment so processing catches up to "now".
+QUEUE_PREEMPTION_FACTOR = 1.2
+PROCESSING_TIME_WINDOW = 4  # segments averaged for the preemption estimate
+DEFAULT_ACCEPTABLE_LATENCY_S = 1

@@ -59,7 +59,7 @@ async def stream_once(path: str, dst_lang: str, fast: bool, tag: str) -> None:
 
         recv_task = asyncio.create_task(receiver())
         await sender()
-        await asyncio.sleep(2)  # drain trailing responses
+        await asyncio.sleep(15)  # drain trailing responses (CPU inference can take several seconds/segment)
         recv_task.cancel()
 
 

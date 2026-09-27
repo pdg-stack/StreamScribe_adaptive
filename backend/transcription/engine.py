@@ -51,34 +51,48 @@ class AdaptiveEngine:
     recent real-time-factor (RTF) samples to decide the active model tier
     and the cpu_status shown in the overlay, and reuses the process-wide
     model cache so stepping between tiers doesn't reload from disk once a
-    tier has already been used once in this process."""
+    tier has already been used once in this process.
 
-    def __init__(self, device: str = "cpu") -> None:
+    `tier_mode` is either "auto" (the cascade below picks the tier) or an
+    explicit tier name ("small"/"base"/"tiny") -- an explicit choice is
+    honored as-is and never overridden by strain, though cpu_status is
+    still computed and shown (useful diagnostic even when not driving a
+    fallback)."""
+
+    def __init__(self, device: str = "cpu", tier_mode: str = "auto") -> None:
         self.device = device
+        self.tier_mode = tier_mode
         self._tier_index = 0  # 0 == MODEL_TIERS[0] == "small"
         self._rtf_samples: list[float] = []
 
     @property
     def model_tier(self) -> str:
+        if self.tier_mode != "auto":
+            return self.tier_mode
         return MODEL_TIERS[self._tier_index]
+
+    def set_tier_mode(self, tier_mode: str) -> None:
+        self.tier_mode = tier_mode
+        self._rtf_samples.clear()
 
     def _record_rtf(self, rtf: float) -> str:
         """Folds `rtf` into the rolling window, steps the active tier up or
-        down once the window is full and consistently past a threshold,
-        and returns this segment's cpu_status."""
+        down once the window is full and consistently past a threshold
+        (only in "auto" tier_mode), and returns this segment's cpu_status."""
         self._rtf_samples.append(rtf)
         self._rtf_samples = self._rtf_samples[-STRAIN_WINDOW:]
         window_full = len(self._rtf_samples) >= STRAIN_WINDOW
         avg_rtf = sum(self._rtf_samples) / len(self._rtf_samples)
+        auto = self.tier_mode == "auto"
 
         if avg_rtf > RTF_YELLOW_MAX:
-            if window_full and self._tier_index < len(MODEL_TIERS) - 1:
+            if auto and window_full and self._tier_index < len(MODEL_TIERS) - 1:
                 self._tier_index += 1
                 self._rtf_samples.clear()
             return "red"
         if avg_rtf > RTF_GREEN_MAX:
             return "yellow"
-        if window_full and self._tier_index > 0:
+        if auto and window_full and self._tier_index > 0:
             self._tier_index -= 1
             self._rtf_samples.clear()
         return "green"
