@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import time
 
-from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtCore import QEvent, QPoint, Qt
 from PyQt6.QtGui import QColor, QFont, QMouseEvent
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -25,6 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .settings import Settings
+from .settings_dialog import SettingsDialog
 
 STRAIN_COLORS = {
     "off": "#555555",
@@ -45,17 +47,17 @@ LANGUAGES = [
 ]
 LANGUAGE_NAMES = dict(LANGUAGES)
 AUTO_CODE = "auto"
+DEFAULT_DEST_LANGUAGE = "en"  # mirrors Settings.dest_language's default
 
 
 class OverlayWindow(QWidget):
-    def __init__(self, settings: Settings, on_src_lang_change, on_dest_lang_change, on_settings_clicked, on_close) -> None:
+    def __init__(self, settings: Settings, on_src_lang_change, on_dest_lang_change, on_close) -> None:
         super().__init__()
         self.settings = settings
         self._on_src_lang_change = on_src_lang_change
         self._on_dest_lang_change = on_dest_lang_change
-        self._on_settings_clicked = on_settings_clicked
         self._on_close = on_close
-        self._show_original = False  # False: translated is primary (default)
+        self._settings_panel: SettingsDialog | None = None
         self._last_partial_update = 0.0
         self._last_event: dict | None = None
         self._drag_offset: QPoint | None = None
@@ -95,14 +97,25 @@ class OverlayWindow(QWidget):
 
         swap_btn = QPushButton("⇄")  # swap arrows
         swap_btn.setObjectName("iconButton")
-        swap_btn.setToolTip("Swap original/translated")
-        swap_btn.clicked.connect(self._toggle_primary)
+        swap_btn.setToolTip("Swap source/destination language")
+        swap_btn.clicked.connect(self._handle_swap)
 
         self.dest_combo = QComboBox()
         for code, name in LANGUAGES:
             self.dest_combo.addItem(name, userData=code)
         self._set_combo_code(self.dest_combo, self.settings.dest_language)
         self.dest_combo.currentIndexChanged.connect(self._handle_dest_change)
+
+        # Source picker, swap, destination picker grouped into one visual
+        # "language selector" chip -- distinct from the status/settings/close
+        # icons on the right.
+        lang_selector = QFrame()
+        lang_selector.setObjectName("languageSelector")
+        lang_layout = QHBoxLayout(lang_selector)
+        lang_layout.setContentsMargins(8, 2, 8, 2)
+        lang_layout.setSpacing(4)
+        for w in (self.source_combo, swap_btn, self.dest_combo):
+            lang_layout.addWidget(w)
 
         self.status_dot = QLabel("●")  # status light
         self.status_dot.setObjectName("statusDot")
@@ -111,18 +124,17 @@ class OverlayWindow(QWidget):
         self.tier_label = QLabel("")
         self.tier_label.setObjectName("tierLabel")
 
-        settings_btn = QPushButton("⚙")  # gear
-        settings_btn.setObjectName("iconButton")
-        settings_btn.clicked.connect(self._on_settings_clicked)
+        self.settings_btn = QPushButton("⚙")  # gear
+        self.settings_btn.setObjectName("iconButton")
+        self.settings_btn.clicked.connect(self._toggle_settings_panel)
 
         close_btn = QPushButton("✕")  # close
         close_btn.setObjectName("iconButton")
         close_btn.clicked.connect(self._handle_close)
 
-        for w in (self.source_combo, swap_btn):
-            layout.addWidget(w)
+        layout.addWidget(lang_selector)
         layout.addStretch(1)
-        for w in (self.dest_combo, self.status_dot, self.tier_label, settings_btn, close_btn):
+        for w in (self.status_dot, self.tier_label, self.settings_btn, close_btn):
             layout.addWidget(w)
 
         return bar
@@ -204,14 +216,52 @@ class OverlayWindow(QWidget):
             self.caption_secondary_label.hide()
             return
 
-        primary, secondary = (text, translated) if self._show_original else (translated, text)
-        self.caption_label.setText(primary)
-        self.caption_secondary_label.setText(secondary)
+        self.caption_label.setText(translated)
+        self.caption_secondary_label.setText(text)
         self.caption_secondary_label.show()
 
-    def _toggle_primary(self) -> None:
-        self._show_original = not self._show_original
-        self._render_caption()
+    def _handle_swap(self) -> None:
+        old_src = self.source_combo.currentData()
+        old_dst = self.dest_combo.currentData()
+        new_src = old_dst
+        # The destination picker has no "Auto Detect" option, so swapping
+        # away from it needs a fallback destination.
+        new_dst = old_src if old_src != AUTO_CODE else DEFAULT_DEST_LANGUAGE
+
+        self._set_combo_code(self.dest_combo, new_dst)
+        self._set_combo_code(self.source_combo, new_src)
+        if new_src != AUTO_CODE:
+            self.source_combo.setItemText(0, "Auto Detect")
+
+    def _toggle_settings_panel(self) -> None:
+        if self._settings_panel is not None:
+            self._settings_panel.close()
+            return
+
+        panel = SettingsDialog(self.settings, on_change=self.apply_settings, parent=self)
+        panel.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        panel.destroyed.connect(self._on_settings_panel_closed)
+        panel.adjustSize()
+        anchor = self.settings_btn.mapToGlobal(self.settings_btn.rect().bottomLeft())
+        panel.move(anchor.x() - panel.width() + self.settings_btn.width(), anchor.y() + 6)
+        panel.show()
+        panel.raise_()
+        panel.activateWindow()
+        self._settings_panel = panel
+        QApplication.instance().installEventFilter(self)
+
+    def _on_settings_panel_closed(self) -> None:
+        self._settings_panel = None
+        QApplication.instance().removeEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if self._settings_panel is not None and event.type() == QEvent.Type.MouseButtonPress:
+            pos = event.globalPosition().toPoint()
+            inside_panel = self._settings_panel.frameGeometry().contains(pos)
+            inside_gear = self.settings_btn.rect().contains(self.settings_btn.mapFromGlobal(pos))
+            if not inside_panel and not inside_gear:
+                self._settings_panel.close()
+        return super().eventFilter(obj, event)
 
     def _handle_src_change(self, index: int) -> None:
         code = self.source_combo.itemData(index)
@@ -263,6 +313,10 @@ class OverlayWindow(QWidget):
             #captionPanel {{
                 background-color: {bg_rgba};
                 border-radius: 14px;
+            }}
+            #languageSelector {{
+                background-color: rgba(255, 255, 255, 20);
+                border-radius: 12px;
             }}
             #tierLabel, #sourceAppLabel {{
                 color: #cccccc;

@@ -16,11 +16,10 @@ from .audio_capture import LoopbackCapture
 from .audio_source_detector import active_source_process
 from .overlay_window import OverlayWindow
 from .settings import Settings
-from .settings_dialog import SettingsDialog
 from .ws_client import WsClient
 
 SOURCE_POLL_MS = 1000
-SINGLETON_KEY = "StreamScribe_fwhisper_singleton"
+SINGLETON_KEY = "StreamScribe_adaptive_singleton"
 
 
 class _EventBridge(QObject):
@@ -38,7 +37,7 @@ def main() -> None:
     # the segment up when that process exits, even if it crashes).
     singleton_guard = QSharedMemory(SINGLETON_KEY)
     if not singleton_guard.create(1):
-        print("StreamScribe_fwhisper is already running -- close it first.")
+        print("StreamScribe_adaptive is already running -- close it first.")
         sys.exit(1)
 
     app = QApplication(sys.argv)
@@ -53,15 +52,10 @@ def main() -> None:
     def on_dest_lang_change(code: str) -> None:
         ws_client.set_dst_lang(code)
 
-    def open_settings() -> None:
-        dialog = SettingsDialog(settings, on_change=overlay.apply_settings)
-        dialog.exec()
-
     overlay = OverlayWindow(
         settings,
         on_src_lang_change=on_src_lang_change,
         on_dest_lang_change=on_dest_lang_change,
-        on_settings_clicked=open_settings,
         on_close=app.quit,
     )
     bridge.event_received.connect(overlay.handle_event)

@@ -1,27 +1,41 @@
-"""Settings dialog: font/color/opacity/refresh-speed controls, applied
-live to the overlay and persisted via Settings.save()."""
+"""Settings panel: font/color/opacity/refresh-speed controls, applied live
+to the overlay and persisted via Settings.save().
+
+Deliberately a frameless QWidget, not a QDialog/.exec(): the main overlay is
+WindowStaysOnTopHint, so a plain QDialog (no matching stays-on-top flag)
+ends up rendered *behind* it -- unreachable to clicks and looking merged
+into the overlay. This also gets its own WindowStaysOnTopHint, is parented
+to the overlay so it doesn't get an independent taskbar/minimize identity,
+and stays fully opaque. Toggled open/closed by the overlay's gear icon and
+closed on an outside click (see OverlayWindow._toggle_settings_panel).
+"""
 
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QColorDialog,
-    QDialog,
     QFontComboBox,
     QFormLayout,
     QPushButton,
     QSlider,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 from .settings import Settings
 
 
-class SettingsDialog(QDialog):
-    def __init__(self, settings: Settings, on_change) -> None:
-        super().__init__()
-        self.setWindowTitle("StreamScribe_fwhisper settings")
+class SettingsDialog(QWidget):
+    def __init__(self, settings: Settings, on_change, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.settings = settings
         self._on_change = on_change
 
@@ -60,7 +74,19 @@ class SettingsDialog(QDialog):
         form.addRow("Subtitle refresh speed (ms)", self.refresh_spin)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
         layout.addLayout(form)
+
+        self.setStyleSheet("""
+            SettingsDialog {
+                background-color: #262626;
+                border: 1px solid #4a4a4a;
+                border-radius: 10px;
+            }
+            QLabel {
+                color: #eeeeee;
+            }
+        """)
 
     def _update(self, field: str, value) -> None:
         setattr(self.settings, field, value)
@@ -68,6 +94,12 @@ class SettingsDialog(QDialog):
         self._on_change(self.settings)
 
     def _pick_color(self, field: str) -> None:
-        color = QColorDialog.getColor()
+        color = QColorDialog.getColor(parent=self)
         if color.isValid():
             self._update(field, color.name())
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
