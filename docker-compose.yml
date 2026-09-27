@@ -6,11 +6,5 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - streamscribe_models:/root/.cache
+      - D:/Work/Docker/streamscribe_models:/root/.cache
     restart: unless-stopped
-
-volumes:
-  # Caches faster-whisper's HF downloads and the converted NLLB-200 CT2
-  # model so they aren't re-fetched/re-converted on every container start.
-  # `docker compose down -v` wipes this -- avoid unless you want a re-download.
-  streamscribe_models:
