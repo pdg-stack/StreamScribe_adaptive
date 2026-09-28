@@ -6,5 +6,5 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - D:/Work/Docker/streamscribe_models:/root/.cache
+      - D:/Work/Docker/shared-model-cache:/root/.cache
     restart: unless-stopped
