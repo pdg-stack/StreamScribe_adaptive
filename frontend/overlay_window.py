@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -29,6 +30,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .caption_icons import LineIconButton
 from .settings import Settings
 from .settings_dialog import SettingsDialog
 
@@ -93,11 +95,13 @@ class OverlayWindow(QWidget):
         self._current_status = "off"
         self._current_tier = ""
         self._current_source_app: str | None = None
+        self._last_queue_length = 0
         self._last_known_engine = settings.engine
         self._last_partial_update = 0.0
         self._caption_entries: list[str] = []  # finalized entries (see _format_entry_html)
         self._current_partial_html = ""
         self._drag_offset: QPoint | None = None
+        self._is_hovering = False
 
         self._listening_timer = QTimer(self)
         self._listening_timer.setSingleShot(True)
@@ -122,7 +126,7 @@ class OverlayWindow(QWidget):
         root.addWidget(self._build_advanced_pane())
 
         self._apply_style()
-        self._update_advanced_pane_visibility()
+        self._apply_auto_hide()
 
     # -- toolbar -----------------------------------------------------
     def _source_languages_for_engine(self, engine: str) -> list[tuple[str, str]]:
@@ -135,8 +139,15 @@ class OverlayWindow(QWidget):
         bar.setObjectName("toolbar")
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(10, 6, 10, 6)
+        self._toolbar = bar
+        # Auto-hide fades opacity rather than calling setVisible(False), so
+        # the toolbar keeps its layout slot and the caption panel below it
+        # never resizes when the header hides/shows.
+        self._toolbar_opacity = QGraphicsOpacityEffect(bar)
+        bar.setGraphicsEffect(self._toolbar_opacity)
 
         self.source_combo = QComboBox()
+        self.source_combo.setObjectName("langCombo")
         self.source_combo.addItem("Auto Detect", userData=AUTO_CODE)
         for code, name in self._source_languages_for_engine(self.settings.engine):
             self.source_combo.addItem(name, userData=code)
@@ -144,11 +155,12 @@ class OverlayWindow(QWidget):
         self.source_combo.currentIndexChanged.connect(self._handle_src_change)
 
         swap_btn = QPushButton("⇄")  # swap arrows
-        swap_btn.setObjectName("iconButton")
+        swap_btn.setObjectName("swapButton")
         swap_btn.setToolTip("Swap source/destination language")
         swap_btn.clicked.connect(self._handle_swap)
 
         self.dest_combo = QComboBox()
+        self.dest_combo.setObjectName("langCombo")
         for code, name in LANGUAGES:
             self.dest_combo.addItem(name, userData=code)
         self._set_combo_code(self.dest_combo, self.settings.dest_language)
@@ -187,6 +199,8 @@ class OverlayWindow(QWidget):
     def _build_caption_panel(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("captionPanel")
+        panel.installEventFilter(self)
+        self._caption_panel = panel
         layout = QVBoxLayout(panel)
 
         # QTextEdit (not QLabel) so long lines wrap to the panel's width and,
@@ -198,7 +212,21 @@ class OverlayWindow(QWidget):
         self.caption_view.setFrameShape(QFrame.Shape.NoFrame)
         layout.addWidget(self.caption_view, stretch=1)
 
+        # Copy/clear -- bottom-left, only shown while the mouse is over the
+        # caption area (see eventFilter's Enter/Leave handling below).
+        self.copy_btn = LineIconButton("copy", color="#dddddd")
+        self.copy_btn.setToolTip("Copy transcript")
+        self.copy_btn.clicked.connect(self._handle_copy_transcript)
+        self.copy_btn.setVisible(False)
+
+        self.clear_btn = LineIconButton("clear", color="#e0392b")
+        self.clear_btn.setToolTip("Clear transcript")
+        self.clear_btn.clicked.connect(self._handle_clear_transcript)
+        self.clear_btn.setVisible(False)
+
         grip_row = QHBoxLayout()
+        grip_row.addWidget(self.copy_btn)
+        grip_row.addWidget(self.clear_btn)
         grip_row.addStretch(1)
         grip_row.addWidget(QSizeGrip(self))
         layout.addLayout(grip_row)
@@ -207,29 +235,32 @@ class OverlayWindow(QWidget):
 
     def _build_advanced_pane(self) -> QFrame:
         # Diagnostic detail hidden from the default view (see plan's
-        # Advanced mode): queue length, the acceptable-delay setting,
-        # active model/tier, and local vs. cloud -- toggled in Settings.
+        # Advanced mode): audio source app, active model/tier, host
+        # (local/cloud), and queue length + acceptable delay -- toggled in
+        # Settings, one item per row.
         pane = QFrame()
         pane.setObjectName("advancedPane")
-        layout = QHBoxLayout(pane)
+        layout = QVBoxLayout(pane)
         layout.setContentsMargins(10, 4, 10, 4)
-        layout.setSpacing(14)
+        layout.setSpacing(1)
+        # Auto-hide fades opacity rather than calling setVisible(False), so
+        # the pane keeps its layout slot and the caption panel above it
+        # never resizes when the footer hides/shows.
+        self._footer_opacity = QGraphicsOpacityEffect(pane)
+        pane.setGraphicsEffect(self._footer_opacity)
 
-        self.advanced_queue_label = QLabel("")
-        self.advanced_latency_label = QLabel("")
+        self.advanced_app_label = QLabel("")
         self.advanced_model_label = QLabel("")
-        self.advanced_source_label = QLabel("")  # local vs. cloud (Modal)
-        self.advanced_app_label = QLabel("")  # which app is currently the audio source
+        self.advanced_host_label = QLabel("")
+        self.advanced_queue_label = QLabel("")
         for w in (
-            self.advanced_queue_label,
-            self.advanced_latency_label,
-            self.advanced_model_label,
-            self.advanced_source_label,
             self.advanced_app_label,
+            self.advanced_model_label,
+            self.advanced_host_label,
+            self.advanced_queue_label,
         ):
             w.setObjectName("advancedLabel")
             layout.addWidget(w)
-        layout.addStretch(1)
 
         self._advanced_pane = pane
         self._update_advanced_pane()
@@ -245,12 +276,18 @@ class OverlayWindow(QWidget):
             self._update_advanced_pane()
             return
 
+        # Queue length (and idle's implicit "0") should always land, even
+        # if the event below is an idle transition or a throttled partial.
+        if "queue_length" in event:
+            self._update_advanced_pane(queue_length=event["queue_length"])
+
         if kind == "idle":
             self._set_status("off")
             return
 
         self._set_status(event.get("cpu_status", "off"))
         self._current_tier = event.get("model_tier", "")
+        self._update_advanced_pane()
 
         detected = event.get("detected_lang")
         if detected and self._is_auto_selected():
@@ -264,11 +301,10 @@ class OverlayWindow(QWidget):
             self._last_partial_update = now
 
         self._record_caption_event(kind, event)
-        self._update_advanced_pane(queue_length=event.get("queue_length"))
 
     def set_source_app(self, name: str | None) -> None:
         self._current_source_app = name
-        self.advanced_app_label.setText(f"Source: {name}" if name else "")
+        self._update_advanced_pane()
 
     def pulse_listening(self) -> None:
         """Called (from the audio thread, via a Qt signal) the instant real
@@ -290,7 +326,7 @@ class OverlayWindow(QWidget):
         engine_changed = settings.engine != self._last_known_engine
         self.settings = settings
         self._apply_style()
-        self._update_advanced_pane_visibility()
+        self._apply_auto_hide()
         self._update_advanced_pane()
         if engine_changed:
             self._rebuild_source_combo()
@@ -319,29 +355,49 @@ class OverlayWindow(QWidget):
             self.settings.save()
             self._on_src_lang_change(new_code)
 
-    def _update_advanced_pane_visibility(self) -> None:
+    def _apply_auto_hide(self) -> None:
+        # Opacity, not setVisible(): hiding the header/footer this way must
+        # not change the caption panel's size, so their layout slot always
+        # stays reserved -- only their visibility (and, while hidden,
+        # click-through) toggles.
+        header_shown = self._is_hovering if self.settings.auto_hide_header else True
+        self._toolbar_opacity.setOpacity(1.0 if header_shown else 0.0)
+        self._toolbar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not header_shown)
+
+        # Advanced mode itself (not auto-hide) still reclaims the footer's
+        # space entirely when off -- that's a separate, existing toggle.
         self._advanced_pane.setVisible(self.settings.advanced_mode)
+        if self.settings.advanced_mode:
+            footer_shown = self._is_hovering if self.settings.auto_hide_footer else True
+            self._footer_opacity.setOpacity(1.0 if footer_shown else 0.0)
+            self._advanced_pane.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not footer_shown)
 
     def _update_advanced_pane(self, queue_length: int | None = None) -> None:
         if queue_length is not None:
-            self.advanced_queue_label.setText(f"Queue: {queue_length}")
-        self.advanced_latency_label.setText(f"Acceptable delay: {self.settings.acceptable_latency_s:g}s")
+            self._last_queue_length = queue_length
+        self.advanced_app_label.setText(f"Source app: {self._current_source_app or '—'}")
         tier = self._current_tier or self.settings.tier
         self.advanced_model_label.setText(f"Model: {self.settings.engine} ({tier})")
         is_cloud = self.modal_status in ("ready", "alive")
-        self.advanced_source_label.setText("Cloud (Modal)" if is_cloud else "Local")
-        if self._current_source_app:
-            self.advanced_app_label.setText(f"Source: {self._current_source_app}")
+        self.advanced_host_label.setText(f"Host: {'Cloud (Modal)' if is_cloud else 'Local'}")
+        self.advanced_queue_label.setText(
+            f"Queue: {self._last_queue_length}    Acceptable delay: {self.settings.acceptable_latency_s:g}s"
+        )
 
     def _format_entry_html(self, event: dict) -> str:
-        text = html.escape(event.get("text", ""))
-        translated = html.escape(event.get("translated_text", ""))
+        raw_text = event.get("text", "")
+        raw_translated = event.get("translated_text", "")
+        text = html.escape(raw_text)
+        translated = html.escape(raw_translated)
         detected = event.get("detected_lang")
         dest_code = self.dest_combo.currentData()
         s = self.settings
 
-        same_lang = bool(detected) and detected == dest_code
-        if same_lang or not event.get("translated_text"):
+        # Same language either by the engine's own report, or because the
+        # translation came back byte-identical (e.g. Parakeet never reports
+        # detected_lang, so this is the only signal available there).
+        same_lang = (bool(detected) and detected == dest_code) or raw_translated == raw_text
+        if same_lang or not raw_translated:
             return f'<div style="color:{s.font_color};">{text}</div>'
 
         font_color = QColor(s.font_color)
@@ -370,9 +426,27 @@ class OverlayWindow(QWidget):
         blocks = list(self._caption_entries)
         if self._current_partial_html:
             blocks.append(self._current_partial_html)
-        self.caption_view.setHtml("<br>".join(blocks))
+
         scrollbar = self.caption_view.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        # Only follow new text if the user was already at the bottom --
+        # otherwise they've scrolled up to read history, and a new line
+        # arriving shouldn't yank the view back down. setHtml() itself
+        # resets the scroll position, so the previous value is always
+        # restored explicitly below regardless of which case applies.
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+        previous_value = scrollbar.value()
+
+        self.caption_view.setHtml("<br>".join(blocks))
+
+        scrollbar.setValue(scrollbar.maximum() if was_at_bottom else previous_value)
+
+    def _handle_copy_transcript(self) -> None:
+        QApplication.clipboard().setText(self.caption_view.toPlainText())
+
+    def _handle_clear_transcript(self) -> None:
+        self._caption_entries = []
+        self._current_partial_html = ""
+        self._render_caption_view()
 
     def _handle_swap(self) -> None:
         old_src = self.source_combo.currentData()
@@ -415,6 +489,13 @@ class OverlayWindow(QWidget):
         QApplication.instance().removeEventFilter(self)
 
     def eventFilter(self, obj, event) -> bool:
+        if obj is self._caption_panel:
+            if event.type() == QEvent.Type.Enter:
+                self.copy_btn.setVisible(True)
+                self.clear_btn.setVisible(True)
+            elif event.type() == QEvent.Type.Leave:
+                self.copy_btn.setVisible(False)
+                self.clear_btn.setVisible(False)
         if self._settings_panel is not None and event.type() == QEvent.Type.MouseButtonPress:
             pos = event.globalPosition().toPoint()
             inside_panel = self._settings_panel.frameGeometry().contains(pos)
@@ -496,11 +577,24 @@ class OverlayWindow(QWidget):
                 background-color: rgba(255, 255, 255, 30);
                 border-radius: 4px;
             }}
-            QComboBox {{
+            #langCombo {{
                 color: #eeeeee;
-                background: transparent;
-                border: none;
+                background-color: rgba(255, 255, 255, 12);
+                border: 1px solid rgba(255, 255, 255, 70);
+                border-radius: 4px;
+                padding: 1px 4px;
                 font-size: 11px;
+            }}
+            #swapButton {{
+                background: transparent;
+                color: #eeeeee;
+                border: 1px solid rgba(255, 255, 255, 70);
+                border-radius: 4px;
+                font-size: 14px;
+                padding: 2px 6px;
+            }}
+            #swapButton:hover {{
+                background-color: rgba(255, 255, 255, 30);
             }}
             #captionView {{
                 background: transparent;
@@ -524,6 +618,16 @@ class OverlayWindow(QWidget):
         if self._drag_offset is not None:
             self._drag_offset = None
             self._save_window_position()
+
+    def enterEvent(self, event) -> None:
+        self._is_hovering = True
+        self._apply_auto_hide()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._is_hovering = False
+        self._apply_auto_hide()
+        super().leaveEvent(event)
 
     def closeEvent(self, event) -> None:
         self._save_window_position()

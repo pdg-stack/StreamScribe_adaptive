@@ -21,7 +21,6 @@ from collections.abc import Callable
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QCheckBox,
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
@@ -39,6 +38,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .settings import Settings
+from .toggle_switch import ToggleSwitch
 
 TIER_OPTIONS = [("auto", "Auto"), ("small", "Small"), ("base", "Base"), ("tiny", "Tiny")]
 ENGINE_OPTIONS = [("faster-whisper", "faster-whisper"), ("parakeet", "Parakeet TDT")]
@@ -69,23 +69,6 @@ COMBO_STYLE = """
     }
 """
 
-# Renders a QCheckBox as a pill-shaped on/off toggle switch (grey = off,
-# green = on) rather than a tick-box -- used for the boolean settings below,
-# not just Advanced mode, so they read consistently as switches.
-TOGGLE_STYLE = """
-    QCheckBox::indicator {
-        width: 34px;
-        height: 18px;
-        border-radius: 9px;
-        background-color: #555555;
-        border: 1px solid #444444;
-    }
-    QCheckBox::indicator:checked {
-        background-color: #3fbf50;
-        border: 1px solid #2e8f3d;
-    }
-"""
-
 
 class SettingsDialog(QWidget):
     def __init__(
@@ -110,6 +93,7 @@ class SettingsDialog(QWidget):
         tabs = QTabWidget()
         tabs.addTab(self._build_appearance_tab(), "Appearance")
         tabs.addTab(self._build_model_config_tab(), "Model config")
+        tabs.addTab(self._build_advanced_tab(), "Advanced")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -133,7 +117,6 @@ class SettingsDialog(QWidget):
             }}
             QTabBar::tab:selected {{ background: #444444; color: #ffffff; }}
             {COMBO_STYLE}
-            {TOGGLE_STYLE}
         """)
 
     # -- Appearance tab ---------------------------------------------------
@@ -148,7 +131,7 @@ class SettingsDialog(QWidget):
         form.addRow("Font", self.font_combo)
 
         self.size_spin = QSpinBox()
-        self.size_spin.setRange(10, 72)
+        self.size_spin.setRange(8, 72)
         self.size_spin.setValue(s.font_size)
         self.size_spin.valueChanged.connect(lambda v: self._update("font_size", v))
         form.addRow("Font size", self.size_spin)
@@ -167,28 +150,57 @@ class SettingsDialog(QWidget):
         self.opacity_slider.valueChanged.connect(lambda v: self._update("background_opacity", v))
         form.addRow("Background opacity", self.opacity_slider)
 
+        return page
+
+    # -- Advanced tab -------------------------------------------------------
+    def _build_advanced_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        s = self.settings
+
+        form = QFormLayout()
         self.refresh_spin = QSpinBox()
         self.refresh_spin.setRange(100, 5000)
         self.refresh_spin.setSingleStep(100)
         self.refresh_spin.setValue(s.refresh_speed_ms)
         self.refresh_spin.valueChanged.connect(lambda v: self._update("refresh_speed_ms", v))
         form.addRow("Subtitle refresh speed (ms)", self.refresh_spin)
+        layout.addLayout(form)
 
-        self.advanced_check = QCheckBox("Show advanced diagnostics under the caption")
-        self.advanced_check.setChecked(s.advanced_mode)
-        self.advanced_check.toggled.connect(lambda v: self._update("advanced_mode", v))
-        form.addRow(self.advanced_check)
-
-        self.persist_check = QCheckBox("Persist subtitles (append instead of replace)")
-        self.persist_check.setToolTip(
-            "On: new subtitles append below older ones, scrollable.\n"
-            "Off: each new subtitle replaces the last one shown."
+        self.advanced_toggle = self._add_toggle_row(
+            layout, "Show advanced diagnostics under the caption", s.advanced_mode, "advanced_mode"
         )
-        self.persist_check.setChecked(s.persist_subtitles)
-        self.persist_check.toggled.connect(lambda v: self._update("persist_subtitles", v))
-        form.addRow(self.persist_check)
+        self.persist_toggle = self._add_toggle_row(
+            layout,
+            "Persist subtitles (append instead of replace)",
+            s.persist_subtitles,
+            "persist_subtitles",
+            tooltip="On: new subtitles append below older ones, scrollable.\nOff: each new subtitle replaces the last one shown.",
+        )
+        self.auto_hide_header_toggle = self._add_toggle_row(
+            layout, "Auto-hide header (show on hover)", s.auto_hide_header, "auto_hide_header"
+        )
+        self.auto_hide_footer_toggle = self._add_toggle_row(
+            layout, "Auto-hide footer (show on hover)", s.auto_hide_footer, "auto_hide_footer"
+        )
 
+        layout.addStretch(1)
         return page
+
+    def _add_toggle_row(self, layout: QVBoxLayout, label: str, checked: bool, field: str, tooltip: str = "") -> ToggleSwitch:
+        row = QHBoxLayout()
+        toggle = ToggleSwitch()
+        toggle.setChecked(checked)
+        toggle.toggled.connect(lambda v: self._update(field, v))
+        text = QLabel(label)
+        if tooltip:
+            text.setToolTip(tooltip)
+            toggle.setToolTip(tooltip)
+        row.addWidget(toggle)
+        row.addWidget(text)
+        row.addStretch(1)
+        layout.addLayout(row)
+        return toggle
 
     # -- Model config tab ---------------------------------------------------
     def _build_model_config_tab(self) -> QWidget:

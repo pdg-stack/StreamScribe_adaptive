@@ -30,6 +30,8 @@ class Settings:
     advanced_mode: bool = False
     inference_mode: str = "local"  # "local" | "modal"
     persist_subtitles: bool = False  # False: newest caption replaces the last; True: appends, scrollable
+    auto_hide_header: bool = False  # hide the toolbar unless the mouse is over the overlay
+    auto_hide_footer: bool = False  # hide the advanced pane unless the mouse is over the overlay
 
     @classmethod
     def load(cls) -> "Settings":
