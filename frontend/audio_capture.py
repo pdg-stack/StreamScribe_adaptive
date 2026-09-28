@@ -19,10 +19,12 @@ CHUNK_FRAMES = 1024
 # Rough "is there real sound right now" gate for the overlay's status light --
 # not a VAD (the backend's webrtcvad is the real authority on speech), just a
 # cheap amplitude check so the light can react to audio the instant it starts
-# rather than waiting several seconds for a backend round-trip. Deliberately
-# low: a missed light-up is worse than an occasional false flicker on faint
-# background noise.
-ACTIVITY_AMPLITUDE_THRESHOLD = 30
+# rather than waiting several seconds for a backend round-trip. High enough
+# to not be tripped by a loopback device's idle noise floor (observed to get
+# the light stuck "on" during genuine silence at very low thresholds); the
+# overlay's own 5s listening-timeout (see OverlayWindow.pulse_listening) is
+# the second, independent line of defense against that.
+ACTIVITY_AMPLITUDE_THRESHOLD = 150
 
 
 class LoopbackCapture:

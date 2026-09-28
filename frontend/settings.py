@@ -29,6 +29,7 @@ class Settings:
     acceptable_latency_s: float = 1.0  # 1-20s, see plan
     advanced_mode: bool = False
     inference_mode: str = "local"  # "local" | "modal"
+    persist_subtitles: bool = False  # False: newest caption replaces the last; True: appends, scrollable
 
     @classmethod
     def load(cls) -> "Settings":

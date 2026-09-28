@@ -11,9 +11,10 @@ in the advanced pane (see plan's Advanced mode), hidden by default.
 
 from __future__ import annotations
 
+import html
 import time
 
-from PyQt6.QtCore import QEvent, QPoint, Qt
+from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer
 from PyQt6.QtGui import QColor, QFont, QMouseEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -23,6 +24,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QSizeGrip,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -37,7 +39,13 @@ STRAIN_COLORS = {
     "red": "#e0392b",
 }
 
-# ISO 639-1 codes shared by both language pickers. The source picker
+# How long the status light stays "on" after the most recent detected
+# activity pulse before reverting to "off" -- see pulse_listening().
+LISTENING_TIMEOUT_MS = 5000
+
+# ISO 639-1 codes for faster-whisper's source picker (and unconditionally
+# for the destination picker -- translation is NLLB-200, independent of
+# whichever ASR engine produced the source text). The source picker
 # additionally gets an "Auto Detect" entry (see plan's Translation
 # section) prepended in _build_toolbar.
 LANGUAGES = [
@@ -48,6 +56,9 @@ LANGUAGES = [
     ("th", "Thai"), ("id", "Indonesian"), ("ur", "Urdu"), ("bn", "Bengali"),
 ]
 LANGUAGE_NAMES = dict(LANGUAGES)
+# Parakeet TDT covers only these (see plan's ASR research) -- no Chinese/
+# Japanese, unlike faster-whisper's full list above.
+PARAKEET_LANGUAGE_CODES = {"en", "es", "ru", "it", "pt"}
 AUTO_CODE = "auto"
 DEFAULT_DEST_LANGUAGE = "en"  # mirrors Settings.dest_language's default
 
@@ -82,9 +93,15 @@ class OverlayWindow(QWidget):
         self._current_status = "off"
         self._current_tier = ""
         self._current_source_app: str | None = None
+        self._last_known_engine = settings.engine
         self._last_partial_update = 0.0
-        self._last_event: dict | None = None
+        self._caption_entries: list[str] = []  # finalized entries (see _format_entry_html)
+        self._current_partial_html = ""
         self._drag_offset: QPoint | None = None
+
+        self._listening_timer = QTimer(self)
+        self._listening_timer.setSingleShot(True)
+        self._listening_timer.timeout.connect(self._on_listening_timeout)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -108,6 +125,11 @@ class OverlayWindow(QWidget):
         self._update_advanced_pane_visibility()
 
     # -- toolbar -----------------------------------------------------
+    def _source_languages_for_engine(self, engine: str) -> list[tuple[str, str]]:
+        if engine == "parakeet":
+            return [(code, name) for code, name in LANGUAGES if code in PARAKEET_LANGUAGE_CODES]
+        return LANGUAGES
+
     def _build_toolbar(self) -> QFrame:
         bar = QFrame()
         bar.setObjectName("toolbar")
@@ -116,7 +138,7 @@ class OverlayWindow(QWidget):
 
         self.source_combo = QComboBox()
         self.source_combo.addItem("Auto Detect", userData=AUTO_CODE)
-        for code, name in LANGUAGES:
+        for code, name in self._source_languages_for_engine(self.settings.engine):
             self.source_combo.addItem(name, userData=code)
         self._set_combo_code(self.source_combo, self.settings.src_language)
         self.source_combo.currentIndexChanged.connect(self._handle_src_change)
@@ -167,16 +189,14 @@ class OverlayWindow(QWidget):
         panel.setObjectName("captionPanel")
         layout = QVBoxLayout(panel)
 
-        self.caption_label = QLabel("")
-        self.caption_label.setWordWrap(True)
-        self.caption_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(self.caption_label)
-
-        self.caption_secondary_label = QLabel("")
-        self.caption_secondary_label.setWordWrap(True)
-        self.caption_secondary_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(self.caption_secondary_label)
-        layout.addStretch(1)
+        # QTextEdit (not QLabel) so long lines wrap to the panel's width and,
+        # when "persist subtitles" is on, older lines scroll rather than
+        # getting clipped.
+        self.caption_view = QTextEdit()
+        self.caption_view.setObjectName("captionView")
+        self.caption_view.setReadOnly(True)
+        self.caption_view.setFrameShape(QFrame.Shape.NoFrame)
+        layout.addWidget(self.caption_view, stretch=1)
 
         grip_row = QHBoxLayout()
         grip_row.addStretch(1)
@@ -243,8 +263,7 @@ class OverlayWindow(QWidget):
                 return
             self._last_partial_update = now
 
-        self._last_event = event
-        self._render_caption()
+        self._record_caption_event(kind, event)
         self._update_advanced_pane(queue_length=event.get("queue_length"))
 
     def set_source_app(self, name: str | None) -> None:
@@ -256,19 +275,49 @@ class OverlayWindow(QWidget):
         audio is detected -- gives immediate feedback rather than waiting
         several seconds for the backend to actually transcribe a segment.
         Only lights up from "off": never overrides a real cpu_status the
-        backend already reported for the segment in progress."""
+        backend already reported for the segment in progress. Restarts the
+        listening timeout regardless, so the light still turns back off a
+        fixed interval after audio actually stops even if the last thing
+        the backend reported was yellow/red."""
         if self._current_status == "off":
             self._set_status("green")
+        self._listening_timer.start(LISTENING_TIMEOUT_MS)
+
+    def _on_listening_timeout(self) -> None:
+        self._set_status("off")
 
     def apply_settings(self, settings: Settings) -> None:
+        engine_changed = settings.engine != self._last_known_engine
         self.settings = settings
         self._apply_style()
         self._update_advanced_pane_visibility()
         self._update_advanced_pane()
+        if engine_changed:
+            self._rebuild_source_combo()
+            self._last_known_engine = settings.engine
 
     # -- internals -------------------------------------------------------
     def _is_auto_selected(self) -> bool:
         return self.source_combo.currentData() == AUTO_CODE
+
+    def _rebuild_source_combo(self) -> None:
+        allowed = self._source_languages_for_engine(self.settings.engine)
+        allowed_codes = {code for code, _ in allowed}
+        previous_code = self.source_combo.currentData()
+
+        self.source_combo.blockSignals(True)
+        self.source_combo.clear()
+        self.source_combo.addItem("Auto Detect", userData=AUTO_CODE)
+        for code, name in allowed:
+            self.source_combo.addItem(name, userData=code)
+        new_code = previous_code if previous_code in allowed_codes or previous_code == AUTO_CODE else AUTO_CODE
+        self._set_combo_code(self.source_combo, new_code)
+        self.source_combo.blockSignals(False)
+
+        if new_code != previous_code:
+            self.settings.src_language = new_code
+            self.settings.save()
+            self._on_src_lang_change(new_code)
 
     def _update_advanced_pane_visibility(self) -> None:
         self._advanced_pane.setVisible(self.settings.advanced_mode)
@@ -284,24 +333,46 @@ class OverlayWindow(QWidget):
         if self._current_source_app:
             self.advanced_app_label.setText(f"Source: {self._current_source_app}")
 
-    def _render_caption(self) -> None:
-        if self._last_event is None:
-            return
-        text = self._last_event.get("text", "")
-        translated = self._last_event.get("translated_text", "")
-        detected = self._last_event.get("detected_lang")
+    def _format_entry_html(self, event: dict) -> str:
+        text = html.escape(event.get("text", ""))
+        translated = html.escape(event.get("translated_text", ""))
+        detected = event.get("detected_lang")
         dest_code = self.dest_combo.currentData()
+        s = self.settings
 
         same_lang = bool(detected) and detected == dest_code
-        if same_lang or not translated:
-            self.caption_label.setText(text)
-            self.caption_secondary_label.setText("")
-            self.caption_secondary_label.hide()
-            return
+        if same_lang or not event.get("translated_text"):
+            return f'<div style="color:{s.font_color};">{text}</div>'
 
-        self.caption_label.setText(translated)
-        self.caption_secondary_label.setText(text)
-        self.caption_secondary_label.show()
+        font_color = QColor(s.font_color)
+        dim_rgba = f"rgba({font_color.red()}, {font_color.green()}, {font_color.blue()}, 150)"
+        secondary_size = max(s.font_size - 2, 8)
+        return (
+            f'<div style="color:{s.font_color};">{translated}</div>'
+            f'<div style="color:{dim_rgba}; font-size:{secondary_size}px;">{text}</div>'
+        )
+
+    def _record_caption_event(self, kind: str, event: dict) -> None:
+        entry_html = self._format_entry_html(event)
+        if kind == "final":
+            if self.settings.persist_subtitles:
+                self._caption_entries.append(entry_html)
+            else:
+                self._caption_entries = [entry_html]
+            self._current_partial_html = ""
+        else:  # partial
+            self._current_partial_html = entry_html
+            if not self.settings.persist_subtitles:
+                self._caption_entries = []
+        self._render_caption_view()
+
+    def _render_caption_view(self) -> None:
+        blocks = list(self._caption_entries)
+        if self._current_partial_html:
+            blocks.append(self._current_partial_html)
+        self.caption_view.setHtml("<br>".join(blocks))
+        scrollbar = self.caption_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _handle_swap(self) -> None:
         old_src = self.source_combo.currentData()
@@ -365,7 +436,7 @@ class OverlayWindow(QWidget):
         self.settings.dest_language = code
         self.settings.save()
         self._on_dest_lang_change(code)
-        self._render_caption()
+        self._render_caption_view()
 
     def _handle_close(self) -> None:
         self._save_window_position()
@@ -392,8 +463,6 @@ class OverlayWindow(QWidget):
         alpha = int(s.background_opacity / 100 * 255)
         bg = QColor(s.background_color)
         bg_rgba = f"rgba({bg.red()}, {bg.green()}, {bg.blue()}, {alpha})"
-        font_color = QColor(s.font_color)
-        dim_rgba = f"rgba({font_color.red()}, {font_color.green()}, {font_color.blue()}, 150)"
 
         self.setStyleSheet(f"""
             #toolbar {{
@@ -433,11 +502,14 @@ class OverlayWindow(QWidget):
                 border: none;
                 font-size: 11px;
             }}
+            #captionView {{
+                background: transparent;
+                border: none;
+            }}
         """)
-        self.caption_label.setFont(QFont(s.font_family, s.font_size))
-        self.caption_label.setStyleSheet(f"color: {s.font_color}; background: transparent;")
-        self.caption_secondary_label.setFont(QFont(s.font_family, max(s.font_size - 2, 8)))
-        self.caption_secondary_label.setStyleSheet(f"color: {dim_rgba}; background: transparent;")
+        self.caption_view.setFont(QFont(s.font_family, s.font_size))
+        self.caption_view.viewport().setStyleSheet("background: transparent;")
+        self._render_caption_view()
 
     # -- window dragging (frameless -> drag from anywhere) ----------------
     def mousePressEvent(self, event: QMouseEvent) -> None:

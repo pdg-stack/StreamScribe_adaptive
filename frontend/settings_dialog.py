@@ -69,6 +69,23 @@ COMBO_STYLE = """
     }
 """
 
+# Renders a QCheckBox as a pill-shaped on/off toggle switch (grey = off,
+# green = on) rather than a tick-box -- used for the boolean settings below,
+# not just Advanced mode, so they read consistently as switches.
+TOGGLE_STYLE = """
+    QCheckBox::indicator {
+        width: 34px;
+        height: 18px;
+        border-radius: 9px;
+        background-color: #555555;
+        border: 1px solid #444444;
+    }
+    QCheckBox::indicator:checked {
+        background-color: #3fbf50;
+        border: 1px solid #2e8f3d;
+    }
+"""
+
 
 class SettingsDialog(QWidget):
     def __init__(
@@ -116,6 +133,7 @@ class SettingsDialog(QWidget):
             }}
             QTabBar::tab:selected {{ background: #444444; color: #ffffff; }}
             {COMBO_STYLE}
+            {TOGGLE_STYLE}
         """)
 
     # -- Appearance tab ---------------------------------------------------
@@ -160,6 +178,15 @@ class SettingsDialog(QWidget):
         self.advanced_check.setChecked(s.advanced_mode)
         self.advanced_check.toggled.connect(lambda v: self._update("advanced_mode", v))
         form.addRow(self.advanced_check)
+
+        self.persist_check = QCheckBox("Persist subtitles (append instead of replace)")
+        self.persist_check.setToolTip(
+            "On: new subtitles append below older ones, scrollable.\n"
+            "Off: each new subtitle replaces the last one shown."
+        )
+        self.persist_check.setChecked(s.persist_subtitles)
+        self.persist_check.toggled.connect(lambda v: self._update("persist_subtitles", v))
+        form.addRow(self.persist_check)
 
         return page
 
