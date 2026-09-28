@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFrame,
     QGraphicsOpacityEffect,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -49,11 +50,17 @@ LISTENING_TIMEOUT_MS = 5000
 # header/footer actually fading out -- see _update_hover_state().
 HIDE_DELAY_MS = 300
 
-# ISO 639-1 codes for faster-whisper's source picker (and unconditionally
-# for the destination picker -- translation is NLLB-200, independent of
-# whichever ASR engine produced the source text). The source picker
-# additionally gets an "Auto Detect" entry (see plan's Translation
-# section) prepended in _build_toolbar.
+# How often _check_delayed polls for staleness, and the multiple of the
+# acceptable-latency setting past which a silent pipeline counts as
+# "delayed" -- mirrors the backend's own QUEUE_PREEMPTION_FACTOR (1.2), the
+# same threshold at which the backend itself starts dropping stale backlog.
+DELAYED_CHECK_INTERVAL_MS = 250
+DELAYED_FACTOR = 1.2
+
+# ISO 639-1 codes for faster-whisper's source AND destination pickers (both
+# filtered identically by the active engine -- see _source_languages_for_
+# engine). The source picker additionally gets an "Auto Detect" entry (see
+# plan's Translation section) prepended in _build_toolbar.
 LANGUAGES = [
     ("en", "English"), ("hi", "Hindi"), ("es", "Spanish"), ("fr", "French"),
     ("de", "German"), ("zh", "Chinese"), ("ja", "Japanese"), ("ko", "Korean"),
@@ -81,12 +88,14 @@ class OverlayWindow(QWidget):
         on_latency_change,
         on_modal_setup_requested,
         on_modal_stop_requested,
+        on_pause_toggled,
     ) -> None:
         super().__init__()
         self.settings = settings
         self._on_src_lang_change = on_src_lang_change
         self._on_dest_lang_change = on_dest_lang_change
         self._on_close = on_close
+        self._on_pause_toggled = on_pause_toggled
         self._settings_actions = {
             "on_engine_change": on_engine_change,
             "on_tier_change": on_tier_change,
@@ -114,6 +123,16 @@ class OverlayWindow(QWidget):
         self._hide_delay_timer = QTimer(self)
         self._hide_delay_timer.setSingleShot(True)
         self._hide_delay_timer.timeout.connect(self._commit_hide)
+
+        # See _check_delayed(): the backend doesn't expose a per-segment
+        # "now waiting" signal (only the eventual result, if it isn't
+        # preempted away), so this approximates "a segment is overdue" by
+        # watching how long it's been since *any* transcript event arrived
+        # while audio is actively playing.
+        self._last_result_at = time.time()
+        self._delayed_timer = QTimer(self)
+        self._delayed_timer.timeout.connect(self._check_delayed)
+        self._delayed_timer.start(DELAYED_CHECK_INTERVAL_MS)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -175,7 +194,7 @@ class OverlayWindow(QWidget):
 
         self.dest_combo = QComboBox()
         self.dest_combo.setObjectName("langCombo")
-        for code, name in LANGUAGES:
+        for code, name in self._source_languages_for_engine(self.settings.engine):
             self.dest_combo.addItem(name, userData=code)
         self._set_combo_code(self.dest_combo, self.settings.dest_language)
         self.dest_combo.currentIndexChanged.connect(self._handle_dest_change)
@@ -191,6 +210,12 @@ class OverlayWindow(QWidget):
         for w in (self.source_combo, swap_btn, self.dest_combo):
             lang_layout.addWidget(w)
 
+        self.pause_btn = QPushButton("⏸")  # pause/resume audio capture
+        self.pause_btn.setObjectName("iconButton")
+        self.pause_btn.setCheckable(True)
+        self.pause_btn.setToolTip("Pause audio capture")
+        self.pause_btn.toggled.connect(self._handle_pause_toggle)
+
         self.status_dot = QLabel("●")  # status light
         self.status_dot.setObjectName("statusDot")
         self._set_status("off")
@@ -205,7 +230,7 @@ class OverlayWindow(QWidget):
 
         layout.addWidget(lang_selector)
         layout.addStretch(1)
-        for w in (self.status_dot, self.settings_btn, close_btn):
+        for w in (self.pause_btn, self.status_dot, self.settings_btn, close_btn):
             layout.addWidget(w)
 
         return bar
@@ -249,32 +274,34 @@ class OverlayWindow(QWidget):
 
     def _build_advanced_pane(self) -> QFrame:
         # Diagnostic detail hidden from the default view (see plan's
-        # Advanced mode): audio source app, active model/tier, host
-        # (local/cloud), and queue length + acceptable delay -- toggled in
-        # Settings, one item per row.
+        # Advanced mode), 2 rows x 3 columns: queue/delay/source app, then
+        # host/model/size -- toggled in Settings.
         pane = QFrame()
         pane.setObjectName("advancedPane")
-        layout = QVBoxLayout(pane)
-        layout.setContentsMargins(10, 4, 10, 4)
-        layout.setSpacing(1)
+        grid = QGridLayout(pane)
+        grid.setContentsMargins(10, 4, 10, 4)
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(1)
         # Auto-hide fades opacity rather than calling setVisible(False), so
         # the pane keeps its layout slot and the caption panel above it
         # never resizes when the footer hides/shows.
         self._footer_opacity = QGraphicsOpacityEffect(pane)
         pane.setGraphicsEffect(self._footer_opacity)
 
-        self.advanced_app_label = QLabel("")
-        self.advanced_model_label = QLabel("")
-        self.advanced_host_label = QLabel("")
         self.advanced_queue_label = QLabel("")
-        for w in (
-            self.advanced_app_label,
-            self.advanced_model_label,
-            self.advanced_host_label,
-            self.advanced_queue_label,
-        ):
+        self.advanced_delay_label = QLabel("")
+        self.advanced_app_label = QLabel("")
+        self.advanced_host_label = QLabel("")
+        self.advanced_model_label = QLabel("")
+        self.advanced_size_label = QLabel("")
+        row0 = (self.advanced_queue_label, self.advanced_delay_label, self.advanced_app_label)
+        row1 = (self.advanced_host_label, self.advanced_model_label, self.advanced_size_label)
+        for col, w in enumerate(row0):
             w.setObjectName("advancedLabel")
-            layout.addWidget(w)
+            grid.addWidget(w, 0, col)
+        for col, w in enumerate(row1):
+            w.setObjectName("advancedLabel")
+            grid.addWidget(w, 1, col)
 
         self._advanced_pane = pane
         self._update_advanced_pane()
@@ -289,6 +316,10 @@ class OverlayWindow(QWidget):
                 self._settings_panel.set_modal_status(self.modal_status)
             self._update_advanced_pane()
             return
+
+        # Any transcript-pipeline event -- partial, final, or idle -- is
+        # evidence the pipeline is still responding; see _check_delayed().
+        self._last_result_at = time.time()
 
         # Queue length (and idle's implicit "0") should always land, even
         # if the event below is an idle transition or a throttled partial.
@@ -336,6 +367,23 @@ class OverlayWindow(QWidget):
     def _on_listening_timeout(self) -> None:
         self._set_status("off")
 
+    def _check_delayed(self) -> None:
+        if self._current_status == "off":
+            return  # no audio active right now, nothing to be overdue
+        threshold = self.settings.acceptable_latency_s * DELAYED_FACTOR
+        if time.time() - self._last_result_at > threshold:
+            self._show_delayed_marker()
+            self._last_result_at = time.time()  # start a fresh window instead of re-showing every tick
+
+    def _show_delayed_marker(self) -> None:
+        marker_html = f'<div style="color:{self.settings.font_color}; font-style: italic;">&lt;delayed&gt;</div>'
+        if self.settings.persist_subtitles:
+            self._caption_entries.append(marker_html)
+        else:
+            self._caption_entries = [marker_html]
+        self._current_partial_html = ""
+        self._render_caption_view()
+
     def apply_settings(self, settings: Settings) -> None:
         engine_changed = settings.engine != self._last_known_engine
         self.settings = settings
@@ -343,31 +391,46 @@ class OverlayWindow(QWidget):
         self._apply_auto_hide()
         self._update_advanced_pane()
         if engine_changed:
-            self._rebuild_source_combo()
+            self._rebuild_language_combos()
             self._last_known_engine = settings.engine
 
     # -- internals -------------------------------------------------------
     def _is_auto_selected(self) -> bool:
         return self.source_combo.currentData() == AUTO_CODE
 
-    def _rebuild_source_combo(self) -> None:
+    def _rebuild_language_combos(self) -> None:
         allowed = self._source_languages_for_engine(self.settings.engine)
         allowed_codes = {code for code, _ in allowed}
-        previous_code = self.source_combo.currentData()
 
+        previous_src = self.source_combo.currentData()
         self.source_combo.blockSignals(True)
         self.source_combo.clear()
         self.source_combo.addItem("Auto Detect", userData=AUTO_CODE)
         for code, name in allowed:
             self.source_combo.addItem(name, userData=code)
-        new_code = previous_code if previous_code in allowed_codes or previous_code == AUTO_CODE else AUTO_CODE
-        self._set_combo_code(self.source_combo, new_code)
+        new_src = previous_src if previous_src in allowed_codes or previous_src == AUTO_CODE else AUTO_CODE
+        self._set_combo_code(self.source_combo, new_src)
         self.source_combo.blockSignals(False)
-
-        if new_code != previous_code:
-            self.settings.src_language = new_code
+        if new_src != previous_src:
+            self.settings.src_language = new_src
             self.settings.save()
-            self._on_src_lang_change(new_code)
+            self._on_src_lang_change(new_src)
+
+        previous_dst = self.dest_combo.currentData()
+        self.dest_combo.blockSignals(True)
+        self.dest_combo.clear()
+        for code, name in allowed:
+            self.dest_combo.addItem(name, userData=code)
+        # DEFAULT_DEST_LANGUAGE ("en") is in every engine's language set, so
+        # it's always a safe fallback -- unlike the source picker, the
+        # destination has no Auto Detect option to fall back to instead.
+        new_dst = previous_dst if previous_dst in allowed_codes else DEFAULT_DEST_LANGUAGE
+        self._set_combo_code(self.dest_combo, new_dst)
+        self.dest_combo.blockSignals(False)
+        if new_dst != previous_dst:
+            self.settings.dest_language = new_dst
+            self.settings.save()
+            self._on_dest_lang_change(new_dst)
 
     def _apply_auto_hide(self) -> None:
         # Opacity, not setVisible(): hiding the header/footer this way must
@@ -389,14 +452,14 @@ class OverlayWindow(QWidget):
     def _update_advanced_pane(self, queue_length: int | None = None) -> None:
         if queue_length is not None:
             self._last_queue_length = queue_length
-        self.advanced_app_label.setText(f"Source app: {self._current_source_app or '—'}")
-        tier = self._current_tier or self.settings.tier
-        self.advanced_model_label.setText(f"Model: {self.settings.engine} ({tier})")
+        self.advanced_queue_label.setText(f"Queue: {self._last_queue_length}")
+        self.advanced_delay_label.setText(f"Delay: {self.settings.acceptable_latency_s:g}s")
+        self.advanced_app_label.setText(f"Source: {self._current_source_app or '—'}")
         is_cloud = self.modal_status in ("ready", "alive")
         self.advanced_host_label.setText(f"Host: {'Cloud (Modal)' if is_cloud else 'Local'}")
-        self.advanced_queue_label.setText(
-            f"Queue: {self._last_queue_length}    Acceptable delay: {self.settings.acceptable_latency_s:g}s"
-        )
+        self.advanced_model_label.setText(f"Model: {self.settings.engine}")
+        tier = self._current_tier or self.settings.tier
+        self.advanced_size_label.setText(f"Size: {tier}")
 
     def _format_entry_html(self, event: dict) -> str:
         raw_text = event.get("text", "")
@@ -462,6 +525,11 @@ class OverlayWindow(QWidget):
         self._current_partial_html = ""
         self._render_caption_view()
 
+    def _handle_pause_toggle(self, checked: bool) -> None:
+        self.pause_btn.setText("▶" if checked else "⏸")
+        self.pause_btn.setToolTip("Resume audio capture" if checked else "Pause audio capture")
+        self._on_pause_toggled(checked)
+
     def _handle_swap(self) -> None:
         old_src = self.source_combo.currentData()
         old_dst = self.dest_combo.currentData()
@@ -514,7 +582,17 @@ class OverlayWindow(QWidget):
                 self.copy_btn.setVisible(False)
                 self.clear_btn.setVisible(False)
 
-        if self._settings_panel is not None and event.type() == QEvent.Type.MouseButtonPress:
+        if (
+            self._settings_panel is not None
+            and event.type() == QEvent.Type.MouseButtonPress
+            and QApplication.activeModalWidget() is None
+        ):
+            # The activeModalWidget() check above matters: without it, a
+            # click *inside* a QColorDialog opened from the settings panel
+            # (itself a separate window, so geometrically "outside" the
+            # panel) was misread as an outside-click and closed the whole
+            # panel mid-pick -- which is why choosing a font/background
+            # color appeared to do nothing or close the dialog outright.
             pos = event.globalPosition().toPoint()
             inside_panel = self._settings_panel.frameGeometry().contains(pos)
             inside_gear = self.settings_btn.rect().contains(self.settings_btn.mapFromGlobal(pos))
@@ -590,6 +668,7 @@ class OverlayWindow(QWidget):
         alpha = int(s.background_opacity / 100 * 255)
         bg = QColor(s.background_color)
         bg_rgba = f"rgba({bg.red()}, {bg.green()}, {bg.blue()}, {alpha})"
+        border_css = f"border: {s.border_thickness}px solid {s.border_color};" if s.border_thickness > 0 else "border: none;"
 
         self.setStyleSheet(f"""
             #toolbar {{
@@ -599,6 +678,7 @@ class OverlayWindow(QWidget):
             #captionPanel {{
                 background-color: {bg_rgba};
                 border-radius: 14px;
+                {border_css}
             }}
             #languageSelector {{
                 background-color: rgba(255, 255, 255, 20);

@@ -54,6 +54,22 @@ def main() -> None:
     def on_dest_lang_change(code: str) -> None:
         ws_client.set_dst_lang(code)
 
+    # A single mutable attribute, read on PortAudio's own capture thread and
+    # written from the Qt thread on a button click -- CPython's GIL makes a
+    # plain bool read/write like this safe without extra locking.
+    audio_state = type("AudioState", (), {"paused": False})()
+
+    def on_pause_toggled(paused: bool) -> None:
+        audio_state.paused = paused
+
+    def on_audio_captured(pcm_bytes: bytes) -> None:
+        if not audio_state.paused:
+            ws_client.send_audio(pcm_bytes)
+
+    def on_audio_activity() -> None:
+        if not audio_state.paused:
+            bridge.audio_activity.emit()
+
     overlay = OverlayWindow(
         settings,
         on_src_lang_change=on_src_lang_change,
@@ -64,6 +80,7 @@ def main() -> None:
         on_latency_change=ws_client.set_acceptable_latency,
         on_modal_setup_requested=ws_client.start_modal_setup,
         on_modal_stop_requested=ws_client.stop_modal,
+        on_pause_toggled=on_pause_toggled,
     )
     bridge.event_received.connect(overlay.handle_event)
     bridge.audio_activity.connect(overlay.pulse_listening)
@@ -77,7 +94,7 @@ def main() -> None:
     ws_client.set_acceptable_latency(settings.acceptable_latency_s)
     ws_client.start()
 
-    capture = LoopbackCapture(on_audio=ws_client.send_audio, on_activity=bridge.audio_activity.emit)
+    capture = LoopbackCapture(on_audio=on_audio_captured, on_activity=on_audio_activity)
     capture.start()
 
     source_timer = QTimer()

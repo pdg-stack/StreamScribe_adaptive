@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QColorDialog,
     QComboBox,
@@ -68,6 +69,8 @@ COMBO_STYLE = """
         border: 1px solid #444444;
     }
 """
+
+SECTION_LABEL_STYLE = "color: #999999; font-weight: bold; font-size: 11px; margin-top: 8px;"
 
 
 class SettingsDialog(QWidget):
@@ -122,35 +125,79 @@ class SettingsDialog(QWidget):
     # -- Appearance tab ---------------------------------------------------
     def _build_appearance_tab(self) -> QWidget:
         page = QWidget()
-        form = QFormLayout(page)
+        layout = QVBoxLayout(page)
         s = self.settings
 
+        typography_label = QLabel("Typography")
+        typography_label.setStyleSheet(SECTION_LABEL_STYLE)
+        layout.addWidget(typography_label)
+
+        type_form = QFormLayout()
         self.font_combo = QFontComboBox()
         self.font_combo.setCurrentFont(self.font_combo.currentFont().__class__(s.font_family))
         self.font_combo.currentFontChanged.connect(lambda f: self._update("font_family", f.family()))
-        form.addRow("Font", self.font_combo)
+        type_form.addRow("Font", self.font_combo)
 
         self.size_spin = QSpinBox()
         self.size_spin.setRange(8, 72)
         self.size_spin.setValue(s.font_size)
         self.size_spin.valueChanged.connect(lambda v: self._update("font_size", v))
-        form.addRow("Font size", self.size_spin)
+        type_form.addRow("Size", self.size_spin)
+        layout.addLayout(type_form)
 
-        font_color_btn = QPushButton("Pick font color")
-        font_color_btn.clicked.connect(lambda: self._pick_color("font_color"))
-        form.addRow(font_color_btn)
+        colors_label = QLabel("Colors")
+        colors_label.setStyleSheet(SECTION_LABEL_STYLE)
+        layout.addWidget(colors_label)
 
-        bg_color_btn = QPushButton("Pick background color")
-        bg_color_btn.clicked.connect(lambda: self._pick_color("background_color"))
-        form.addRow(bg_color_btn)
+        color_row = QHBoxLayout()
+        self.font_color_btn = self._build_color_button("Font", "font_color")
+        self.bg_color_btn = self._build_color_button("Background", "background_color")
+        self.border_color_btn = self._build_color_button("Border", "border_color")
+        color_row.addWidget(self.font_color_btn)
+        color_row.addWidget(self.bg_color_btn)
+        color_row.addWidget(self.border_color_btn)
+        layout.addLayout(color_row)
 
+        border_form = QFormLayout()
+        self.border_thickness_spin = QSpinBox()
+        self.border_thickness_spin.setRange(0, 10)
+        self.border_thickness_spin.setSuffix(" px")
+        self.border_thickness_spin.setValue(s.border_thickness)
+        self.border_thickness_spin.valueChanged.connect(lambda v: self._update("border_thickness", v))
+        border_form.addRow("Border thickness", self.border_thickness_spin)
+        layout.addLayout(border_form)
+
+        display_label = QLabel("Display")
+        display_label.setStyleSheet(SECTION_LABEL_STYLE)
+        layout.addWidget(display_label)
+
+        display_form = QFormLayout()
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(0, 100)
         self.opacity_slider.setValue(s.background_opacity)
         self.opacity_slider.valueChanged.connect(lambda v: self._update("background_opacity", v))
-        form.addRow("Background opacity", self.opacity_slider)
+        display_form.addRow("Background opacity", self.opacity_slider)
+        layout.addLayout(display_form)
 
+        layout.addStretch(1)
         return page
+
+    def _build_color_button(self, label: str, field: str) -> QPushButton:
+        btn = QPushButton(label)
+        btn.setObjectName("colorButton")
+        self._paint_color_button(btn, getattr(self.settings, field))
+        btn.clicked.connect(lambda: self._pick_color(field, btn))
+        return btn
+
+    @staticmethod
+    def _paint_color_button(btn: QPushButton, hex_color: str) -> None:
+        text_color = "#000000" if QColor(hex_color).lightnessF() > 0.5 else "#ffffff"
+        btn.setStyleSheet(
+            f"QPushButton#colorButton {{"
+            f"  background-color: {hex_color}; color: {text_color};"
+            f"  border: 1px solid #666666; border-radius: 4px; padding: 6px;"
+            f"}}"
+        )
 
     # -- Advanced tab -------------------------------------------------------
     def _build_advanced_tab(self) -> QWidget:
@@ -288,10 +335,12 @@ class SettingsDialog(QWidget):
         self.settings.save()
         self._on_change(self.settings)
 
-    def _pick_color(self, field: str) -> None:
-        color = QColorDialog.getColor(parent=self)
+    def _pick_color(self, field: str, btn: QPushButton) -> None:
+        initial = QColor(getattr(self.settings, field))
+        color = QColorDialog.getColor(initial, self)
         if color.isValid():
             self._update(field, color.name())
+            self._paint_color_button(btn, color.name())
 
     def _update_tier_enabled(self) -> None:
         self.tier_combo.setEnabled(self.engine_combo.currentData() == "faster-whisper")
