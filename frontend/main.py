@@ -23,11 +23,13 @@ SINGLETON_KEY = "StreamScribe_adaptive_singleton"
 
 
 class _EventBridge(QObject):
-    """WsClient's callbacks fire from a background asyncio thread; Qt
-    widgets may only be touched from the GUI thread. Routing through a
-    signal marshals the call onto the GUI thread's event loop safely."""
+    """WsClient's callbacks fire from a background asyncio thread, and
+    LoopbackCapture's from PortAudio's own thread; Qt widgets may only be
+    touched from the GUI thread. Routing through a signal marshals each
+    call onto the GUI thread's event loop safely."""
 
     event_received = pyqtSignal(dict)
+    audio_activity = pyqtSignal()
 
 
 def main() -> None:
@@ -64,6 +66,7 @@ def main() -> None:
         on_modal_stop_requested=ws_client.stop_modal,
     )
     bridge.event_received.connect(overlay.handle_event)
+    bridge.audio_activity.connect(overlay.pulse_listening)
     overlay.show()
 
     ws_client.set_src_lang(settings.src_language)
@@ -74,7 +77,7 @@ def main() -> None:
     ws_client.set_acceptable_latency(settings.acceptable_latency_s)
     ws_client.start()
 
-    capture = LoopbackCapture(on_audio=ws_client.send_audio)
+    capture = LoopbackCapture(on_audio=ws_client.send_audio, on_activity=bridge.audio_activity.emit)
     capture.start()
 
     source_timer = QTimer()

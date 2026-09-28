@@ -1,10 +1,12 @@
 """Transparent, always-on-top floating overlay -- the core UI. Layout
 targets the ViiTor Translate reference screenshot (see plan): a slim pill
-toolbar (source-language picker with an Auto Detect option, swap icon,
-destination dropdown, settings gear, model-tier badge + CPU-strain light,
+toolbar (a "language selector" chip -- source picker with an Auto Detect
+option, swap icon, destination picker -- a CPU-strain light, settings gear,
 close) above a semi-transparent caption panel. Partial-result text updates
 in place (no layout jump), rate-limited by the refresh-speed setting so
-rapid partial updates don't visibly flicker.
+rapid partial updates don't visibly flicker. The model-tier badge and
+source-app label are diagnostic detail, not everyday UI -- they live only
+in the advanced pane (see plan's Advanced mode), hidden by default.
 """
 
 from __future__ import annotations
@@ -77,6 +79,9 @@ class OverlayWindow(QWidget):
         }
         self._settings_panel: SettingsDialog | None = None
         self.modal_status = "terminated"
+        self._current_status = "off"
+        self._current_tier = ""
+        self._current_source_app: str | None = None
         self._last_partial_update = 0.0
         self._last_event: dict | None = None
         self._drag_offset: QPoint | None = None
@@ -142,9 +147,6 @@ class OverlayWindow(QWidget):
         self.status_dot.setObjectName("statusDot")
         self._set_status("off")
 
-        self.tier_label = QLabel("")
-        self.tier_label.setObjectName("tierLabel")
-
         self.settings_btn = QPushButton("⚙")  # gear
         self.settings_btn.setObjectName("iconButton")
         self.settings_btn.clicked.connect(self._toggle_settings_panel)
@@ -155,7 +157,7 @@ class OverlayWindow(QWidget):
 
         layout.addWidget(lang_selector)
         layout.addStretch(1)
-        for w in (self.status_dot, self.tier_label, self.settings_btn, close_btn):
+        for w in (self.status_dot, self.settings_btn, close_btn):
             layout.addWidget(w)
 
         return bar
@@ -164,10 +166,6 @@ class OverlayWindow(QWidget):
         panel = QFrame()
         panel.setObjectName("captionPanel")
         layout = QVBoxLayout(panel)
-
-        self.source_app_label = QLabel("")
-        self.source_app_label.setObjectName("sourceAppLabel")
-        layout.addWidget(self.source_app_label)
 
         self.caption_label = QLabel("")
         self.caption_label.setWordWrap(True)
@@ -200,8 +198,15 @@ class OverlayWindow(QWidget):
         self.advanced_queue_label = QLabel("")
         self.advanced_latency_label = QLabel("")
         self.advanced_model_label = QLabel("")
-        self.advanced_source_label = QLabel("")
-        for w in (self.advanced_queue_label, self.advanced_latency_label, self.advanced_model_label, self.advanced_source_label):
+        self.advanced_source_label = QLabel("")  # local vs. cloud (Modal)
+        self.advanced_app_label = QLabel("")  # which app is currently the audio source
+        for w in (
+            self.advanced_queue_label,
+            self.advanced_latency_label,
+            self.advanced_model_label,
+            self.advanced_source_label,
+            self.advanced_app_label,
+        ):
             w.setObjectName("advancedLabel")
             layout.addWidget(w)
         layout.addStretch(1)
@@ -225,7 +230,7 @@ class OverlayWindow(QWidget):
             return
 
         self._set_status(event.get("cpu_status", "off"))
-        self.tier_label.setText(event.get("model_tier", ""))
+        self._current_tier = event.get("model_tier", "")
 
         detected = event.get("detected_lang")
         if detected and self._is_auto_selected():
@@ -243,7 +248,17 @@ class OverlayWindow(QWidget):
         self._update_advanced_pane(queue_length=event.get("queue_length"))
 
     def set_source_app(self, name: str | None) -> None:
-        self.source_app_label.setText(f"Source: {name}" if name else "")
+        self._current_source_app = name
+        self.advanced_app_label.setText(f"Source: {name}" if name else "")
+
+    def pulse_listening(self) -> None:
+        """Called (from the audio thread, via a Qt signal) the instant real
+        audio is detected -- gives immediate feedback rather than waiting
+        several seconds for the backend to actually transcribe a segment.
+        Only lights up from "off": never overrides a real cpu_status the
+        backend already reported for the segment in progress."""
+        if self._current_status == "off":
+            self._set_status("green")
 
     def apply_settings(self, settings: Settings) -> None:
         self.settings = settings
@@ -262,10 +277,12 @@ class OverlayWindow(QWidget):
         if queue_length is not None:
             self.advanced_queue_label.setText(f"Queue: {queue_length}")
         self.advanced_latency_label.setText(f"Acceptable delay: {self.settings.acceptable_latency_s:g}s")
-        tier = self.tier_label.text() or self.settings.tier
+        tier = self._current_tier or self.settings.tier
         self.advanced_model_label.setText(f"Model: {self.settings.engine} ({tier})")
         is_cloud = self.modal_status in ("ready", "alive")
         self.advanced_source_label.setText("Cloud (Modal)" if is_cloud else "Local")
+        if self._current_source_app:
+            self.advanced_app_label.setText(f"Source: {self._current_source_app}")
 
     def _render_caption(self) -> None:
         if self._last_event is None:
@@ -366,6 +383,7 @@ class OverlayWindow(QWidget):
             combo.setCurrentIndex(idx)
 
     def _set_status(self, status: str) -> None:
+        self._current_status = status
         color = STRAIN_COLORS.get(status, STRAIN_COLORS["off"])
         self.status_dot.setStyleSheet(f"color: {color}; font-size: 14px;")
 
@@ -394,7 +412,7 @@ class OverlayWindow(QWidget):
                 background-color: rgba(0, 0, 0, {min(alpha + 20, 255)});
                 border-radius: 10px;
             }}
-            #tierLabel, #sourceAppLabel, #advancedLabel {{
+            #advancedLabel {{
                 color: #cccccc;
                 font-size: 11px;
             }}

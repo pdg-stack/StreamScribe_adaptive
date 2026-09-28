@@ -1,5 +1,5 @@
-"""Settings panel: appearance, model/engine, and cloud (Modal) controls,
-applied live to the overlay and persisted via Settings.save().
+"""Settings panel: appearance and model-config controls, applied live to
+the overlay and persisted via Settings.save().
 
 Deliberately a frameless QWidget, not a QDialog/.exec(): the main overlay is
 WindowStaysOnTopHint, so a plain QDialog (no matching stays-on-top flag)
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFontComboBox,
     QFormLayout,
+    QHBoxLayout,
     QLabel,
     QPushButton,
     QRadioButton,
@@ -53,6 +54,21 @@ MODAL_STATUS_DISPLAY = {
     "alive": ("#3fbf50", "Alive"),
 }
 
+COMBO_STYLE = """
+    QComboBox {
+        color: #eeeeee;
+        background-color: #333333;
+        border: 1px solid #5a5a5a;
+        border-radius: 4px;
+        padding: 3px 6px;
+    }
+    QComboBox:disabled {
+        color: #888888;
+        background-color: #2a2a2a;
+        border: 1px solid #444444;
+    }
+"""
+
 
 class SettingsDialog(QWidget):
     def __init__(
@@ -76,29 +92,30 @@ class SettingsDialog(QWidget):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_appearance_tab(), "Appearance")
-        tabs.addTab(self._build_model_tab(), "Model")
-        tabs.addTab(self._build_cloud_tab(), "Cloud (Modal)")
+        tabs.addTab(self._build_model_config_tab(), "Model config")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.addWidget(tabs)
 
         self.set_modal_status(modal_status)
+        self._update_mode_pages()
 
-        self.setStyleSheet("""
-            SettingsDialog {
+        self.setStyleSheet(f"""
+            SettingsDialog {{
                 background-color: #262626;
                 border: 1px solid #4a4a4a;
                 border-radius: 10px;
-            }
-            QLabel { color: #eeeeee; }
-            QTabWidget::pane { border: 1px solid #4a4a4a; border-radius: 6px; }
-            QTabBar::tab {
+            }}
+            QLabel {{ color: #eeeeee; }}
+            QTabWidget::pane {{ border: 1px solid #4a4a4a; border-radius: 6px; }}
+            QTabBar::tab {{
                 background: #333333;
                 color: #cccccc;
                 padding: 6px 12px;
-            }
-            QTabBar::tab:selected { background: #444444; color: #ffffff; }
+            }}
+            QTabBar::tab:selected {{ background: #444444; color: #ffffff; }}
+            {COMBO_STYLE}
         """)
 
     # -- Appearance tab ---------------------------------------------------
@@ -146,10 +163,41 @@ class SettingsDialog(QWidget):
 
         return page
 
-    # -- Model tab ---------------------------------------------------------
-    def _build_model_tab(self) -> QWidget:
+    # -- Model config tab ---------------------------------------------------
+    def _build_model_config_tab(self) -> QWidget:
         page = QWidget()
-        form = QFormLayout(page)
+        layout = QVBoxLayout(page)
+        s = self.settings
+
+        form = QFormLayout()
+        self.latency_spin = QDoubleSpinBox()
+        self.latency_spin.setRange(1, 20)
+        self.latency_spin.setSingleStep(1)
+        self.latency_spin.setSuffix(" s")
+        self.latency_spin.setValue(s.acceptable_latency_s)
+        self.latency_spin.valueChanged.connect(self._handle_latency_change)
+        form.addRow("Acceptable delay", self.latency_spin)
+        layout.addLayout(form)
+
+        radio_row = QHBoxLayout()
+        self.local_radio = QRadioButton("Local")
+        self.cloud_radio = QRadioButton("Cloud (Modal.com GPU)")
+        self.cloud_radio.setChecked(s.inference_mode == "modal")
+        self.local_radio.setChecked(s.inference_mode != "modal")
+        self.local_radio.toggled.connect(self._handle_inference_mode_change)
+        radio_row.addWidget(self.local_radio)
+        radio_row.addWidget(self.cloud_radio)
+        radio_row.addStretch(1)
+        layout.addLayout(radio_row)
+
+        layout.addWidget(self._build_local_page())
+        layout.addWidget(self._build_cloud_page())
+        layout.addStretch(1)
+        return page
+
+    def _build_local_page(self) -> QWidget:
+        self.local_page = QWidget()
+        form = QFormLayout(self.local_page)
         s = self.settings
 
         self.engine_combo = QComboBox()
@@ -166,29 +214,13 @@ class SettingsDialog(QWidget):
         self.tier_combo.currentIndexChanged.connect(self._handle_tier_change)
         form.addRow("Model size", self.tier_combo)
 
-        self.latency_spin = QDoubleSpinBox()
-        self.latency_spin.setRange(1, 20)
-        self.latency_spin.setSingleStep(1)
-        self.latency_spin.setSuffix(" s")
-        self.latency_spin.setValue(s.acceptable_latency_s)
-        self.latency_spin.valueChanged.connect(self._handle_latency_change)
-        form.addRow("Acceptable delay", self.latency_spin)
-
         self._update_tier_enabled()
-        return page
+        return self.local_page
 
-    # -- Cloud (Modal) tab ---------------------------------------------------
-    def _build_cloud_tab(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-
-        self.local_radio = QRadioButton("Local (CPU)")
-        self.modal_radio = QRadioButton("Modal (cloud GPU)")
-        self.modal_radio.setChecked(self.settings.inference_mode == "modal")
-        self.local_radio.setChecked(self.settings.inference_mode != "modal")
-        self.local_radio.toggled.connect(self._handle_inference_mode_change)
-        layout.addWidget(self.local_radio)
-        layout.addWidget(self.modal_radio)
+    def _build_cloud_page(self) -> QWidget:
+        self.cloud_page = QWidget()
+        layout = QVBoxLayout(self.cloud_page)
+        layout.setContentsMargins(0, 4, 0, 0)
 
         self.modal_status_label = QLabel("")
         layout.addWidget(self.modal_status_label)
@@ -201,8 +233,7 @@ class SettingsDialog(QWidget):
         self.modal_stop_btn.clicked.connect(self._handle_modal_stop)
         layout.addWidget(self.modal_stop_btn)
 
-        layout.addStretch(1)
-        return page
+        return self.cloud_page
 
     # -- live updates from the backend (modal_setup_status events) --------
     def set_modal_status(self, status: str) -> None:
@@ -226,6 +257,11 @@ class SettingsDialog(QWidget):
     def _update_tier_enabled(self) -> None:
         self.tier_combo.setEnabled(self.engine_combo.currentData() == "faster-whisper")
 
+    def _update_mode_pages(self) -> None:
+        is_cloud = self.cloud_radio.isChecked()
+        self.local_page.setVisible(not is_cloud)
+        self.cloud_page.setVisible(is_cloud)
+
     def _handle_engine_change(self, index: int) -> None:
         code = self.engine_combo.itemData(index)
         self._update("engine", code)
@@ -244,6 +280,7 @@ class SettingsDialog(QWidget):
     def _handle_inference_mode_change(self, local_checked: bool) -> None:
         mode = "local" if local_checked else "modal"
         self._update("inference_mode", mode)
+        self._update_mode_pages()
         if mode == "modal":
             # Modal only runs faster-whisper (see plan) -- force the engine
             # choice so there's nothing to silently route around.
