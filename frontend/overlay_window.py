@@ -15,10 +15,9 @@ import html
 import time
 
 from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer
-from PyQt6.QtGui import QColor, QCursor, QFont, QMouseEvent
+from PyQt6.QtGui import QColor, QCursor, QFont, QMouseEvent, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -32,6 +31,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .caption_icons import LineIconButton
+from .language_dropdown import LanguageDropdown
 from .settings import Settings
 from .settings_dialog import SettingsDialog
 
@@ -104,6 +104,21 @@ class OverlayWindow(QWidget):
             "on_modal_stop_requested": on_modal_stop_requested,
         }
         self._settings_panel: SettingsDialog | None = None
+        # eventFilter unconditionally references these (built by the
+        # _build_* methods below) -- Qt can dispatch an event through an
+        # installed filter synchronously, mid-construction, before all of
+        # them exist yet. An AttributeError escaping eventFilter (a Qt
+        # virtual-override callback) doesn't raise cleanly -- it corrupts
+        # Qt's internal state and crashes the process natively. Placeholder
+        # None values here mean eventFilter's own `obj in (...)` /
+        # attribute-access checks are always safe, however early they fire.
+        self._toolbar = None
+        self._caption_panel = None
+        self._advanced_pane = None
+        self.caption_view = None
+        self.copy_btn = None
+        self.clear_btn = None
+        self.settings_btn = None
         self.modal_status = "terminated"
         self._current_status = "off"
         self._current_tier = ""
@@ -179,25 +194,25 @@ class OverlayWindow(QWidget):
         self._toolbar_opacity = QGraphicsOpacityEffect(bar)
         bar.setGraphicsEffect(self._toolbar_opacity)
 
-        self.source_combo = QComboBox()
+        self.source_combo = LanguageDropdown()
         self.source_combo.setObjectName("langCombo")
         self.source_combo.addItem("Auto Detect", userData=AUTO_CODE)
         for code, name in self._source_languages_for_engine(self.settings.engine):
             self.source_combo.addItem(name, userData=code)
-        self._set_combo_code(self.source_combo, self.settings.src_language)
-        self.source_combo.currentIndexChanged.connect(self._handle_src_change)
+        self.source_combo.set_current_code(self.settings.src_language)
+        self.source_combo.codeChanged.connect(self._handle_src_change)
 
         swap_btn = QPushButton("⇄")  # swap arrows
         swap_btn.setObjectName("swapButton")
         swap_btn.setToolTip("Swap source/destination language")
         swap_btn.clicked.connect(self._handle_swap)
 
-        self.dest_combo = QComboBox()
+        self.dest_combo = LanguageDropdown()
         self.dest_combo.setObjectName("langCombo")
         for code, name in self._source_languages_for_engine(self.settings.engine):
             self.dest_combo.addItem(name, userData=code)
-        self._set_combo_code(self.dest_combo, self.settings.dest_language)
-        self.dest_combo.currentIndexChanged.connect(self._handle_dest_change)
+        self.dest_combo.set_current_code(self.settings.dest_language)
+        self.dest_combo.codeChanged.connect(self._handle_dest_change)
 
         # Source picker, swap, destination picker grouped into one visual
         # "language selector" chip -- distinct from the status/settings/close
@@ -225,7 +240,7 @@ class OverlayWindow(QWidget):
         self.settings_btn.clicked.connect(self._toggle_settings_panel)
 
         close_btn = QPushButton("✕")  # close
-        close_btn.setObjectName("iconButton")
+        close_btn.setObjectName("closeButton")
         close_btn.clicked.connect(self._handle_close)
 
         layout.addWidget(lang_selector)
@@ -238,8 +253,8 @@ class OverlayWindow(QWidget):
     def _build_caption_panel(self) -> QFrame:
         panel = QFrame()
         panel.setObjectName("captionPanel")
-        panel.installEventFilter(self)
         self._caption_panel = panel
+        panel.installEventFilter(self)
         layout = QVBoxLayout(panel)
 
         # QTextEdit (not QLabel) so long lines wrap to the panel's width and,
@@ -249,27 +264,29 @@ class OverlayWindow(QWidget):
         self.caption_view.setObjectName("captionView")
         self.caption_view.setReadOnly(True)
         self.caption_view.setFrameShape(QFrame.Shape.NoFrame)
+        self.caption_view.installEventFilter(self)
         layout.addWidget(self.caption_view, stretch=1)
 
-        # Copy/clear -- bottom-left, only shown while the mouse is over the
-        # caption area (see eventFilter's Enter/Leave handling below).
-        self.copy_btn = LineIconButton("copy", color="#dddddd")
+        # Copy/clear -- top-right corner of the text field, floating over
+        # it as plain children (NOT part of any layout), so toggling their
+        # visibility on hover never reflows/resizes the caption area or
+        # shifts the scroll position the way it did as layout items.
+        self.copy_btn = LineIconButton("copy", color="#dddddd", parent=self.caption_view)
         self.copy_btn.setToolTip("Copy transcript")
         self.copy_btn.clicked.connect(self._handle_copy_transcript)
         self.copy_btn.setVisible(False)
 
-        self.clear_btn = LineIconButton("clear", color="#e0392b")
+        self.clear_btn = LineIconButton("clear", color="#e0392b", parent=self.caption_view)
         self.clear_btn.setToolTip("Clear transcript")
         self.clear_btn.clicked.connect(self._handle_clear_transcript)
         self.clear_btn.setVisible(False)
 
         grip_row = QHBoxLayout()
-        grip_row.addWidget(self.copy_btn)
-        grip_row.addWidget(self.clear_btn)
         grip_row.addStretch(1)
         grip_row.addWidget(QSizeGrip(self))
         layout.addLayout(grip_row)
 
+        self._reposition_caption_icons()
         return panel
 
     def _build_advanced_pane(self) -> QFrame:
@@ -409,7 +426,7 @@ class OverlayWindow(QWidget):
         for code, name in allowed:
             self.source_combo.addItem(name, userData=code)
         new_src = previous_src if previous_src in allowed_codes or previous_src == AUTO_CODE else AUTO_CODE
-        self._set_combo_code(self.source_combo, new_src)
+        self.source_combo.set_current_code(new_src)
         self.source_combo.blockSignals(False)
         if new_src != previous_src:
             self.settings.src_language = new_src
@@ -425,7 +442,7 @@ class OverlayWindow(QWidget):
         # it's always a safe fallback -- unlike the source picker, the
         # destination has no Auto Detect option to fall back to instead.
         new_dst = previous_dst if previous_dst in allowed_codes else DEFAULT_DEST_LANGUAGE
-        self._set_combo_code(self.dest_combo, new_dst)
+        self.dest_combo.set_current_code(new_dst)
         self.dest_combo.blockSignals(False)
         if new_dst != previous_dst:
             self.settings.dest_language = new_dst
@@ -507,15 +524,34 @@ class OverlayWindow(QWidget):
         scrollbar = self.caption_view.verticalScrollBar()
         # Only follow new text if the user was already at the bottom --
         # otherwise they've scrolled up to read history, and a new line
-        # arriving shouldn't yank the view back down. setHtml() itself
-        # resets the scroll position, so the previous value is always
-        # restored explicitly below regardless of which case applies.
+        # arriving shouldn't yank the view back down.
         was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
         previous_value = scrollbar.value()
 
         self.caption_view.setHtml("<br>".join(blocks))
 
-        scrollbar.setValue(scrollbar.maximum() if was_at_bottom else previous_value)
+        if was_at_bottom:
+            # Not scrollbar.setValue(scrollbar.maximum()): QTextEdit's
+            # document layout can still be settling right after setHtml(),
+            # so maximum() read immediately afterward is sometimes stale
+            # (one render behind), and the view would stop short of the
+            # true bottom. Moving the cursor to the document's end is the
+            # idiomatic Qt way to scroll a QTextEdit to "follow" new text
+            # and isn't subject to that staleness.
+            self.caption_view.moveCursor(QTextCursor.MoveOperation.End)
+        else:
+            scrollbar.setValue(previous_value)
+
+    def _reposition_caption_icons(self) -> None:
+        margin = 6
+        width = self.caption_view.width()
+        y = margin
+        x = width - self.clear_btn.width() - margin
+        self.clear_btn.move(x, y)
+        x -= self.copy_btn.width() + 4
+        self.copy_btn.move(x, y)
+        self.copy_btn.raise_()
+        self.clear_btn.raise_()
 
     def _handle_copy_transcript(self) -> None:
         QApplication.clipboard().setText(self.caption_view.toPlainText())
@@ -538,10 +574,14 @@ class OverlayWindow(QWidget):
         # away from it needs a fallback destination.
         new_dst = old_src if old_src != AUTO_CODE else DEFAULT_DEST_LANGUAGE
 
-        self._set_combo_code(self.dest_combo, new_dst)
-        self._set_combo_code(self.source_combo, new_src)
-        if new_src != AUTO_CODE:
-            self.source_combo.setItemText(0, "Auto Detect")
+        # set_current_code() deliberately doesn't emit codeChanged (unlike
+        # QComboBox.setCurrentIndex, which fires even when set
+        # programmatically) -- call the handlers explicitly so the swap
+        # still persists and notifies the backend, not just the UI text.
+        self.dest_combo.set_current_code(new_dst)
+        self._handle_dest_change(new_dst)
+        self.source_combo.set_current_code(new_src)
+        self._handle_src_change(new_src)
 
     def _toggle_settings_panel(self) -> None:
         if self._settings_panel is not None:
@@ -581,6 +621,9 @@ class OverlayWindow(QWidget):
             elif event.type() == QEvent.Type.Leave:
                 self.copy_btn.setVisible(False)
                 self.clear_btn.setVisible(False)
+
+        if obj is self.caption_view and event.type() == QEvent.Type.Resize:
+            self._reposition_caption_icons()
 
         if (
             self._settings_panel is not None
@@ -628,16 +671,14 @@ class OverlayWindow(QWidget):
         self._is_hovering = self.frameGeometry().contains(QCursor.pos())
         self._apply_auto_hide()
 
-    def _handle_src_change(self, index: int) -> None:
-        code = self.source_combo.itemData(index)
+    def _handle_src_change(self, code: str) -> None:
         if code != AUTO_CODE:
             self.source_combo.setItemText(0, "Auto Detect")  # reset stale detected-language suffix
         self.settings.src_language = code
         self.settings.save()
         self._on_src_lang_change(code)
 
-    def _handle_dest_change(self, index: int) -> None:
-        code = self.dest_combo.itemData(index)
+    def _handle_dest_change(self, code: str) -> None:
         self.settings.dest_language = code
         self.settings.save()
         self._on_dest_lang_change(code)
@@ -651,12 +692,6 @@ class OverlayWindow(QWidget):
         self.settings.window_x = self.x()
         self.settings.window_y = self.y()
         self.settings.save()
-
-    @staticmethod
-    def _set_combo_code(combo: QComboBox, code: str) -> None:
-        idx = combo.findData(code)
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
 
     def _set_status(self, status: str) -> None:
         self._current_status = status
@@ -700,6 +735,18 @@ class OverlayWindow(QWidget):
                 padding: 2px 6px;
             }}
             #iconButton:hover {{
+                background-color: rgba(255, 255, 255, 30);
+                border-radius: 4px;
+            }}
+            #closeButton {{
+                background: transparent;
+                color: #eeeeee;
+                border: none;
+                font-size: 15px;
+                font-weight: bold;
+                padding: 2px 6px;
+            }}
+            #closeButton:hover {{
                 background-color: rgba(255, 255, 255, 30);
                 border-radius: 4px;
             }}
