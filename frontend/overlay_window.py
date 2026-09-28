@@ -15,7 +15,7 @@ import html
 import time
 
 from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer
-from PyQt6.QtGui import QColor, QFont, QMouseEvent
+from PyQt6.QtGui import QColor, QCursor, QFont, QMouseEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -44,6 +44,10 @@ STRAIN_COLORS = {
 # How long the status light stays "on" after the most recent detected
 # activity pulse before reverting to "off" -- see pulse_listening().
 LISTENING_TIMEOUT_MS = 5000
+
+# Grace period between the cursor leaving the overlay and the auto-hidden
+# header/footer actually fading out -- see _update_hover_state().
+HIDE_DELAY_MS = 300
 
 # ISO 639-1 codes for faster-whisper's source picker (and unconditionally
 # for the destination picker -- translation is NLLB-200, independent of
@@ -107,6 +111,10 @@ class OverlayWindow(QWidget):
         self._listening_timer.setSingleShot(True)
         self._listening_timer.timeout.connect(self._on_listening_timeout)
 
+        self._hide_delay_timer = QTimer(self)
+        self._hide_delay_timer.setSingleShot(True)
+        self._hide_delay_timer.timeout.connect(self._commit_hide)
+
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -119,11 +127,17 @@ class OverlayWindow(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(4)
+        root.setSpacing(0)
 
         root.addWidget(self._build_toolbar())
         root.addWidget(self._build_caption_panel(), stretch=1)
         root.addWidget(self._build_advanced_pane())
+
+        # Enter/Leave on the toolbar or footer specifically (not just self)
+        # also needs to reach _update_hover_state -- see its docstring for
+        # why (moving onto a child widget fires a spurious Leave on self).
+        self._toolbar.installEventFilter(self)
+        self._advanced_pane.installEventFilter(self)
 
         self._apply_style()
         self._apply_auto_hide()
@@ -489,6 +503,9 @@ class OverlayWindow(QWidget):
         QApplication.instance().removeEventFilter(self)
 
     def eventFilter(self, obj, event) -> bool:
+        if event.type() in (QEvent.Type.Enter, QEvent.Type.Leave) and obj in (self._toolbar, self._caption_panel, self._advanced_pane):
+            self._update_hover_state()
+
         if obj is self._caption_panel:
             if event.type() == QEvent.Type.Enter:
                 self.copy_btn.setVisible(True)
@@ -496,6 +513,7 @@ class OverlayWindow(QWidget):
             elif event.type() == QEvent.Type.Leave:
                 self.copy_btn.setVisible(False)
                 self.clear_btn.setVisible(False)
+
         if self._settings_panel is not None and event.type() == QEvent.Type.MouseButtonPress:
             pos = event.globalPosition().toPoint()
             inside_panel = self._settings_panel.frameGeometry().contains(pos)
@@ -503,6 +521,34 @@ class OverlayWindow(QWidget):
             if not inside_panel and not inside_gear:
                 self._settings_panel.close()
         return super().eventFilter(obj, event)
+
+    def _update_hover_state(self) -> None:
+        """Re-derives hover purely from cursor position vs. this window's
+        own screen rect -- not from which specific child widget an Enter/
+        Leave event was targeted at. Qt fires Leave on this window when the
+        cursor moves onto a *child* widget too (the toolbar, the caption
+        panel, the footer), even though the cursor never actually left the
+        window's bounds; treating that as a real leave was what made an
+        auto-hidden header/footer impossible to reach ("locked in") -- the
+        cursor crossing from the caption panel into the toolbar looked
+        identical to it leaving the window entirely."""
+        hovering = self.frameGeometry().contains(QCursor.pos())
+        if hovering:
+            # Always stop, not just when _is_hovering was already False:
+            # a hide can be *pending* (timer running) while _is_hovering is
+            # still True, since that flag only flips in _commit_hide. Using
+            # "hovering == self._is_hovering" as a no-op shortcut here would
+            # skip cancelling that pending hide on a quick re-entry.
+            self._hide_delay_timer.stop()
+            if not self._is_hovering:
+                self._is_hovering = True
+                self._apply_auto_hide()
+        elif self._is_hovering and not self._hide_delay_timer.isActive():
+            self._hide_delay_timer.start(HIDE_DELAY_MS)
+
+    def _commit_hide(self) -> None:
+        self._is_hovering = self.frameGeometry().contains(QCursor.pos())
+        self._apply_auto_hide()
 
     def _handle_src_change(self, index: int) -> None:
         code = self.source_combo.itemData(index)
@@ -620,13 +666,11 @@ class OverlayWindow(QWidget):
             self._save_window_position()
 
     def enterEvent(self, event) -> None:
-        self._is_hovering = True
-        self._apply_auto_hide()
+        self._update_hover_state()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
-        self._is_hovering = False
-        self._apply_auto_hide()
+        self._update_hover_state()
         super().leaveEvent(event)
 
     def closeEvent(self, event) -> None:
