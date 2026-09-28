@@ -93,7 +93,18 @@ class AdaptiveEngine:
         if avg_rtf > RTF_GREEN_MAX:
             return "yellow"
         if auto and window_full and self._tier_index > 0:
-            self._tier_index -= 1
+            # Jump straight back to the best tier rather than creeping up
+            # one step at a time: incrementally stepping tiny->base->small
+            # needs a full clean STRAIN_WINDOW streak at *each* intermediate
+            # tier, and switching to a heavier tier right after recovering
+            # tends to itself nudge RTF back up for a segment or two --
+            # easy to get stuck just below "small" indefinitely. Always
+            # attempting "small" and letting the existing demotion logic
+            # above cascade back down through base/tiny if it's still too
+            # slow gets back to the best tier whenever it's actually
+            # sustainable, with no new failure mode (demotion already
+            # handles a bad attempt correctly).
+            self._tier_index = 0
             self._rtf_samples.clear()
         return "green"
 
