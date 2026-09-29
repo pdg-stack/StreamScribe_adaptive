@@ -32,6 +32,13 @@ class SegmentQueue:
         self._processing_times: list[float] = []
         self._next_seq = 0
 
+    @property
+    def next_seq(self) -> int:
+        """The seq the next push() would assign -- i.e. "one past
+        everything pushed so far". Used by ResultSequencer.submit_idle to
+        place the idle transition correctly in sequence order."""
+        return self._next_seq
+
     def push(self, event: SegmenterEvent) -> None:
         self._items.append(QueuedSegment(event=event, enqueued_at=time.time(), seq=self._next_seq))
         self._next_seq += 1

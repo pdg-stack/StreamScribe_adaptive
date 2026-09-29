@@ -11,15 +11,21 @@ echo ============================================================
 echo StreamScribe_adaptive -- starting up
 echo ============================================================
 
+REM Always build+recreate, not just when unhealthy: gating the build on a
+REM health check meant an already-running (but stale) container from a
+REM previous session would never pick up backend code changes at all --
+REM you could be testing against week-old code with no indication. Docker
+REM layer caching makes an up-to-date build a fast no-op, and
+REM `up -d --build` only actually recreates the container when the image
+REM genuinely changed, so this stays cheap on the common case.
+echo.
+echo Checking for backend updates and ensuring the container is running...
+echo.
+docker compose -f "%COMPOSE_FILE%" up -d --build
+
 for /f "delims=" %%A in ('curl -s -o nul -w "%%{http_code}" %BACKEND_URL% 2^>nul') do set "HEALTH_CODE=%%A"
 
 if not "!HEALTH_CODE!"=="200" (
-    echo.
-    echo Backend not ready -- building the image ^(if needed^) and starting the container...
-    echo On a first run this also downloads the ASR/translation models, which can take a while.
-    echo.
-    docker compose -f "%COMPOSE_FILE%" up -d --build
-
     echo.
     echo Waiting for the backend to finish loading models...
     echo ------------------------------------------------------------

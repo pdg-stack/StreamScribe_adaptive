@@ -6,7 +6,11 @@ events:
      "text": str, "detected_lang": str, "translated_text": str,
      "model_tier": "small"|"base"|"tiny",
      "cpu_status": "green"|"yellow"|"red"|"off",
-     "segment_closed_at": float, "queue_length": int, "timestamp": float}
+     "segment_closed_at": float, "queue_length": int, "workers": int, "timestamp": float}
+
+("workers" is PARALLEL_WORKERS, config.py -- static for the process's
+lifetime, sent on every event since there's no dedicated handshake message
+for it yet.)
 
 ("idle" events omit text/detected_lang/translated_text/segment_closed_at --
 they only fire once on the transition into silence, so the frontend can
@@ -40,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import traceback
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket
@@ -144,12 +149,13 @@ async def _handle_modal_setup(
         state.engine_name = "modal"
         asyncio.create_task(_modal_heartbeat(websocket, engines, state, send_lock))
     except Exception as exc:
-        # Printed here (Docker logs) *and* sent to the frontend -- silently
-        # reverting to "terminated" with no detail was the actual bug
-        # report ("modal instance setup is failing"): the failure was real
-        # but invisible, on both ends.
-        print(f"[Modal] setup failed: {exc}", flush=True)
-        await _send_modal_status(websocket, send_lock, "terminated", error=str(exc))
+        # Full traceback here (Docker logs), a concise message to the
+        # frontend -- silently reverting to "terminated" with no detail at
+        # all was the actual bug report ("modal instance setup is
+        # failing"): the failure was real but invisible, on both ends.
+        print(f"[Modal] setup failed:\n{traceback.format_exc()}", flush=True)
+        error_text = str(exc) or type(exc).__name__  # some exceptions str() to ""
+        await _send_modal_status(websocket, send_lock, "terminated", error=error_text)
 
 
 async def _handle_modal_stop(websocket: WebSocket, engines: dict, state: ConnectionState, send_lock: asyncio.Lock) -> None:
@@ -168,7 +174,10 @@ async def _handle_modal_stop(websocket: WebSocket, engines: dict, state: Connect
     await _send_modal_status(websocket, send_lock, "terminated")
 
 
-async def _receiver(websocket: WebSocket, segmenter: VadSegmenter, queue: SegmentQueue, state: ConnectionState, send_lock: asyncio.Lock, engines: dict) -> None:
+async def _receiver(
+    websocket: WebSocket, segmenter: VadSegmenter, queue: SegmentQueue, state: ConnectionState,
+    send_lock: asyncio.Lock, engines: dict, sequencer: ResultSequencer,
+) -> None:
     was_speaking = False
 
     while True:
@@ -190,14 +199,21 @@ async def _receiver(websocket: WebSocket, segmenter: VadSegmenter, queue: Segmen
                 was_speaking = True
 
             if was_speaking and not segmenter.in_speech:
-                async with send_lock:
-                    await websocket.send_text(json.dumps({
-                        "type": "idle",
-                        "model_tier": engines[state.engine_name].model_tier,
-                        "cpu_status": "off",
-                        "queue_length": len(queue),
-                        "timestamp": time.time(),
-                    }))
+                # Through the sequencer (not sent directly), at the seq
+                # "one past everything pushed so far" -- see
+                # ResultSequencer.submit_idle for why: sent directly, this
+                # could race ahead of a still-in-flight segment's result
+                # and get overwritten by it, leaving the status light
+                # showing stale strain with nothing left to ever correct
+                # it once audio actually stops.
+                idle_message = {
+                    "type": "idle",
+                    "model_tier": engines[state.engine_name].model_tier,
+                    "cpu_status": "off",
+                    "queue_length": len(queue),
+                    "workers": PARALLEL_WORKERS,
+                }
+                await sequencer.submit_idle(queue.next_seq, idle_message, websocket, send_lock)
                 was_speaking = False
 
         elif message.get("text") is not None:
@@ -273,6 +289,7 @@ async def _processor(
             "cpu_status": result.cpu_status,
             "segment_closed_at": item.event.closed_at,
             "queue_length": len(queue),
+            "workers": PARALLEL_WORKERS,
         }
         await sequencer.submit_result(item.seq, message, state.acceptable_latency, websocket, send_lock)
 
@@ -305,7 +322,7 @@ async def ws_transcribe(websocket: WebSocket) -> None:
     # workers -- see result_sequencer.py.
     sequencer = ResultSequencer()
 
-    receiver_task = asyncio.create_task(_receiver(websocket, segmenter, queue, state, send_lock, engines))
+    receiver_task = asyncio.create_task(_receiver(websocket, segmenter, queue, state, send_lock, engines, sequencer))
     # PARALLEL_WORKERS concurrent consumers of the same queue, not one --
     # see config.py's PARALLEL_WORKERS docstring for why the count is
     # sized off the CPU actually available. Each awaits queue.pop()
