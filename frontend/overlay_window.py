@@ -784,6 +784,7 @@ class OverlayWindow(QWidget):
         self.setStyleSheet(f"""
             #toolbar {{
                 background-color: rgba(30, 30, 30, {min(alpha + 40, 255)});
+                border: 1px solid rgba(255, 255, 255, 60);
                 border-radius: 14px;
             }}
             #captionPanel {{
@@ -796,6 +797,7 @@ class OverlayWindow(QWidget):
             }}
             #advancedPane {{
                 background-color: rgba(0, 0, 0, {min(alpha + 20, 255)});
+                border: 1px solid rgba(255, 255, 255, 60);
                 border-radius: 10px;
             }}
             #advancedLabel {{
