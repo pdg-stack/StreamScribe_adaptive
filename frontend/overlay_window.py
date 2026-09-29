@@ -124,6 +124,7 @@ class OverlayWindow(QWidget):
         self._current_tier = ""
         self._current_source_app: str | None = None
         self._last_queue_length = 0
+        self._last_worker_count: int | None = None  # unknown until the backend's first event
         self._last_known_engine = settings.engine
         self._last_partial_update = 0.0
         # Raw content, not pre-rendered HTML: _format_entry_html() renders
@@ -269,6 +270,12 @@ class OverlayWindow(QWidget):
         self.caption_view.setObjectName("captionView")
         self.caption_view.setReadOnly(True)
         self.caption_view.setFrameShape(QFrame.Shape.NoFrame)
+        # Always visible (not just when content overflows), with a
+        # permanently reserved vertical strip -- not floating over the
+        # text -- so it's unambiguous whether the view is scrolled and
+        # where, and it never has to jostle for space with the copy/clear
+        # icons the way an overlay scrollbar would.
+        self.caption_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.caption_view.installEventFilter(self)
         layout.addWidget(self.caption_view, stretch=1)
 
@@ -296,8 +303,8 @@ class OverlayWindow(QWidget):
 
     def _build_advanced_pane(self) -> QFrame:
         # Diagnostic detail hidden from the default view (see plan's
-        # Advanced mode), 2 rows x 3 columns: queue/delay/source app, then
-        # host/model/size -- toggled in Settings.
+        # Advanced mode), 2 rows x 4 columns: queue/threads/delay/source
+        # app, then host/model/size -- toggled in Settings.
         pane = QFrame()
         pane.setObjectName("advancedPane")
         grid = QGridLayout(pane)
@@ -311,12 +318,13 @@ class OverlayWindow(QWidget):
         pane.setGraphicsEffect(self._footer_opacity)
 
         self.advanced_queue_label = QLabel("")
+        self.advanced_threads_label = QLabel("")
         self.advanced_delay_label = QLabel("")
         self.advanced_app_label = QLabel("")
         self.advanced_host_label = QLabel("")
         self.advanced_model_label = QLabel("")
         self.advanced_size_label = QLabel("")
-        row0 = (self.advanced_queue_label, self.advanced_delay_label, self.advanced_app_label)
+        row0 = (self.advanced_queue_label, self.advanced_threads_label, self.advanced_delay_label, self.advanced_app_label)
         row1 = (self.advanced_host_label, self.advanced_model_label, self.advanced_size_label)
         for col, w in enumerate(row0):
             w.setObjectName("advancedLabel")
@@ -349,10 +357,13 @@ class OverlayWindow(QWidget):
         # evidence the pipeline is still responding; see _check_delayed().
         self._last_result_at = time.time()
 
-        # Queue length (and idle's implicit "0") should always land, even
-        # if the event below is an idle transition or a throttled partial.
-        if "queue_length" in event:
-            self._update_advanced_pane(queue_length=event["queue_length"])
+        # Queue length/worker count (and idle's implicit "0"/unchanged
+        # count) should always land, even if the event below is an idle
+        # transition or a throttled partial.
+        if "queue_length" in event or "workers" in event:
+            self._update_advanced_pane(
+                queue_length=event.get("queue_length"), workers=event.get("workers")
+            )
 
         if kind == "idle":
             self._set_status("off")
@@ -480,10 +491,13 @@ class OverlayWindow(QWidget):
             self._footer_opacity.setOpacity(1.0 if footer_shown else 0.0)
             self._advanced_pane.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not footer_shown)
 
-    def _update_advanced_pane(self, queue_length: int | None = None) -> None:
+    def _update_advanced_pane(self, queue_length: int | None = None, workers: int | None = None) -> None:
         if queue_length is not None:
             self._last_queue_length = queue_length
+        if workers is not None:
+            self._last_worker_count = workers
         self.advanced_queue_label.setText(f"Queue: {self._last_queue_length}")
+        self.advanced_threads_label.setText(f"Threads: {self._last_worker_count if self._last_worker_count is not None else '—'}")
         self.advanced_delay_label.setText(f"Delay: {self.settings.acceptable_latency_s:g}s")
         self.advanced_app_label.setText(f"Source: {self._current_source_app or '—'}")
         # Visible even with the settings panel closed -- local is the
@@ -503,15 +517,15 @@ class OverlayWindow(QWidget):
         tier = self._current_tier or self.settings.tier
         self.advanced_size_label.setText(f"Size: {tier}")
 
-    def _wrap_text_border(self, inner_html: str) -> str:
-        """A border around the caption text itself -- border_color/
-        thickness -- distinct from background_color/opacity, which is the
-        floating panel's own background (#captionPanel in _apply_style).
-        Kept as a thin frame hugging the text (no fill), not a highlight
-        box: its purpose is contrast between the text and whatever's
-        behind it (the panel, or anything showing through a transparent
-        one), which matters most exactly when font/background colors are
-        close together.
+    def _wrap_text_outline(self, inner_html: str) -> str:
+        """The caption text's own outline -- outline_color/outline_width --
+        distinct from background_color/opacity, which is the floating
+        panel's own background (#captionPanel in _apply_style). Kept as a
+        thin frame hugging the text (no fill), not a highlight box: its
+        purpose is contrast between the text and whatever's behind it (the
+        panel, or anything showing through a transparent one), which
+        matters most exactly when font/background colors are close
+        together.
 
         A single-cell <table>, not a styled <div>: QTextDocument's rich-
         text engine (used by QTextEdit) silently drops a `border` CSS
@@ -526,8 +540,8 @@ class OverlayWindow(QWidget):
         a design choice."""
         s = self.settings
         return (
-            f'<table cellspacing="0" cellpadding="1" border="{s.border_thickness}" '
-            f'style="border-color:{s.border_color}; border-style:solid;">'
+            f'<table cellspacing="0" cellpadding="1" border="{s.outline_width}" '
+            f'style="border-color:{s.outline_color}; border-style:solid;">'
             f'<tr><td>{inner_html}</td></tr></table>'
         )
 
@@ -535,7 +549,7 @@ class OverlayWindow(QWidget):
         s = self.settings
 
         if entry.get("marker") == "delayed":
-            return self._wrap_text_border(f'<span style="color:{s.font_color}; font-style: italic;">&lt;delayed&gt;</span>')
+            return self._wrap_text_outline(f'<span style="color:{s.font_color}; font-style: italic;">&lt;delayed&gt;</span>')
 
         raw_text = entry.get("text", "")
         raw_translated = entry.get("translated_text", "")
@@ -549,12 +563,12 @@ class OverlayWindow(QWidget):
         # detected_lang, so this is the only signal available there).
         same_lang = (bool(detected) and detected == dest_code) or raw_translated == raw_text
         if same_lang or not raw_translated:
-            return self._wrap_text_border(f'<span style="color:{s.font_color};">{text}</span>')
+            return self._wrap_text_outline(f'<span style="color:{s.font_color};">{text}</span>')
 
         font_color = QColor(s.font_color)
         dim_rgba = f"rgba({font_color.red()}, {font_color.green()}, {font_color.blue()}, 150)"
         secondary_size = max(s.font_size - 2, 8)
-        return self._wrap_text_border(
+        return self._wrap_text_outline(
             f'<div style="color:{s.font_color};">{translated}</div>'
             f'<div style="color:{dim_rgba}; font-size:{secondary_size}px;">{text}</div>'
         )
@@ -587,29 +601,25 @@ class OverlayWindow(QWidget):
         if self._current_partial_entry is not None:
             blocks.append(self._format_entry_html(self._current_partial_entry))
 
-        scrollbar = self.caption_view.verticalScrollBar()
-        # Only follow new text if the user was already at the bottom --
-        # otherwise they've scrolled up to read history, and a new line
-        # arriving shouldn't yank the view back down.
-        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
-        previous_value = scrollbar.value()
-
         self.caption_view.setHtml("<br>".join(blocks))
 
-        if was_at_bottom:
-            # Neither scrollbar.setValue(scrollbar.maximum()) nor
-            # moveCursor(End) right here are reliable: QTextEdit's document
-            # layout is still settling synchronously after setHtml()
-            # returns, so maximum() can read stale (one render behind), and
-            # moveCursor's "scroll the new position into view" side effect
-            # depends on cursor-visibility bookkeeping that a read-only,
-            # never-focused QTextEdit doesn't reliably trigger. Deferring to
-            # the next event-loop turn (after layout has actually finished)
-            # and then setting the scrollbar value directly is what
-            # actually, reliably lands at the true bottom.
-            QTimer.singleShot(0, self._scroll_caption_to_bottom)
-        else:
-            scrollbar.setValue(previous_value)
+        # Unconditional, not "only if the user was already at the bottom":
+        # that smart-follow version kept proving unreliable in practice
+        # (was_at_bottom's own tolerance/staleness edge cases), so this
+        # always snaps to the bottom on every render instead of trying to
+        # preserve a reading-history scroll position.
+        #
+        # Neither scrollbar.setValue(scrollbar.maximum()) nor
+        # moveCursor(End) right here are reliable on their own: QTextEdit's
+        # document layout is still settling synchronously after setHtml()
+        # returns, so maximum() can read stale (one render behind), and
+        # moveCursor's "scroll the new position into view" side effect
+        # depends on cursor-visibility bookkeeping that a read-only,
+        # never-focused QTextEdit doesn't reliably trigger. Deferring to
+        # the next event-loop turn (after layout has actually finished)
+        # and then setting the scrollbar value directly is what actually,
+        # reliably lands at the true bottom.
+        QTimer.singleShot(0, self._scroll_caption_to_bottom)
 
     def _scroll_caption_to_bottom(self) -> None:
         scrollbar = self.caption_view.verticalScrollBar()
@@ -617,7 +627,11 @@ class OverlayWindow(QWidget):
 
     def _reposition_caption_icons(self) -> None:
         margin = 6
-        width = self.caption_view.width()
+        # The scrollbar now always occupies its own strip on the right
+        # (see _build_caption_panel) -- keep the icons clear of it rather
+        # than floating over it.
+        scrollbar_width = self.caption_view.verticalScrollBar().sizeHint().width()
+        width = self.caption_view.width() - scrollbar_width
         y = margin
         x = width - self.clear_btn.width() - margin
         self.clear_btn.move(x, y)
@@ -677,11 +691,9 @@ class OverlayWindow(QWidget):
         panel.raise_()
         panel.activateWindow()
         self._settings_panel = panel
-        QApplication.instance().installEventFilter(self)
 
     def _on_settings_panel_closed(self) -> None:
         self._settings_panel = None
-        QApplication.instance().removeEventFilter(self)
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() in (QEvent.Type.Enter, QEvent.Type.Leave) and obj in (self._toolbar, self._caption_panel, self._advanced_pane):
@@ -698,22 +710,6 @@ class OverlayWindow(QWidget):
         if obj is self.caption_view and event.type() == QEvent.Type.Resize:
             self._reposition_caption_icons()
 
-        if (
-            self._settings_panel is not None
-            and event.type() == QEvent.Type.MouseButtonPress
-            and QApplication.activeModalWidget() is None
-        ):
-            # The activeModalWidget() check above matters: without it, a
-            # click *inside* a QColorDialog opened from the settings panel
-            # (itself a separate window, so geometrically "outside" the
-            # panel) was misread as an outside-click and closed the whole
-            # panel mid-pick -- which is why choosing a font/background
-            # color appeared to do nothing or close the dialog outright.
-            pos = event.globalPosition().toPoint()
-            inside_panel = self._settings_panel.frameGeometry().contains(pos)
-            inside_gear = self.settings_btn.rect().contains(self.settings_btn.mapFromGlobal(pos))
-            if not inside_panel and not inside_gear:
-                self._settings_panel.close()
         return super().eventFilter(obj, event)
 
     def _update_hover_state(self) -> None:
@@ -775,9 +771,9 @@ class OverlayWindow(QWidget):
         s = self.settings
         # background_color/background_opacity is the app window's own
         # translucency -- the floating toolbar/caption panel/footer chrome
-        # -- not the caption text (that's border_color/thickness, on the
-        # text itself; see _wrap_text_border). Restored to that after a
-        # round where it was temporarily repurposed as a text highlight;
+        # -- not the caption text (that's outline_color/outline_width, on
+        # the text itself; see _wrap_text_outline). Restored to that after
+        # a round where it was temporarily repurposed as a text highlight;
         # this is the original, correct scope.
         alpha = int(s.background_opacity / 100 * 255)
         bg = QColor(s.background_color)

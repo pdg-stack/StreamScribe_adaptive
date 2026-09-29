@@ -19,9 +19,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QEvent, Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QApplication,
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
@@ -166,29 +167,29 @@ class SettingsDialog(QWidget):
 
         text_label = QLabel("Caption text")
         text_label.setStyleSheet(SECTION_LABEL_STYLE)
-        text_label.setToolTip("The caption text itself -- its fill color and the border/outline framing it.")
+        text_label.setToolTip("The caption text itself -- its fill color and the outline framing it.")
         layout.addWidget(text_label)
 
         color_row = QHBoxLayout()
         self.font_color_btn = self._build_color_button("Font", "font_color", "Caption text color.")
-        self.border_color_btn = self._build_color_button(
-            "Border", "border_color",
-            "Border color around the caption text itself -- helps the text stand out when "
+        self.outline_color_btn = self._build_color_button(
+            "Outline", "outline_color",
+            "Outline color around the caption text itself -- helps the text stand out when "
             "font color and whatever's behind it are close in color."
         )
         color_row.addWidget(self.font_color_btn)
-        color_row.addWidget(self.border_color_btn)
+        color_row.addWidget(self.outline_color_btn)
         layout.addLayout(color_row)
 
-        border_form = QFormLayout()
-        self.border_thickness_spin = QSpinBox()
-        self.border_thickness_spin.setRange(0, 10)
-        self.border_thickness_spin.setSuffix(" px")
-        self.border_thickness_spin.setValue(s.border_thickness)
-        self.border_thickness_spin.setToolTip("Border thickness around the caption text, in pixels (0 = no border).")
-        self.border_thickness_spin.valueChanged.connect(lambda v: self._update("border_thickness", v))
-        border_form.addRow("Text border thickness", self.border_thickness_spin)
-        layout.addLayout(border_form)
+        outline_form = QFormLayout()
+        self.outline_width_spin = QSpinBox()
+        self.outline_width_spin.setRange(0, 10)
+        self.outline_width_spin.setSuffix(" px")
+        self.outline_width_spin.setValue(s.outline_width)
+        self.outline_width_spin.setToolTip("Outline width around the caption text, in pixels (0 = no outline).")
+        self.outline_width_spin.valueChanged.connect(lambda v: self._update("outline_width", v))
+        outline_form.addRow("Text outline width", self.outline_width_spin)
+        layout.addLayout(outline_form)
 
         window_label = QLabel("App window")
         window_label.setStyleSheet(SECTION_LABEL_STYLE)
@@ -212,6 +213,30 @@ class SettingsDialog(QWidget):
 
         layout.addStretch(1)
         return page
+
+    def _build_secret_field(self, placeholder: str, field: str, initial: str) -> tuple[QLineEdit, QHBoxLayout]:
+        """A password-masked QLineEdit with an eye-icon toggle button next
+        to it, so the value can be checked without retyping it -- used for
+        the Modal Token ID/Secret fields."""
+        edit = QLineEdit(initial)
+        edit.setEchoMode(QLineEdit.EchoMode.Password)
+        edit.setPlaceholderText(placeholder)
+        edit.editingFinished.connect(lambda: self._update(field, edit.text()))
+
+        reveal_btn = QPushButton("\U0001F441")  # eye
+        reveal_btn.setObjectName("revealButton")
+        reveal_btn.setCheckable(True)
+        reveal_btn.setToolTip("Show/hide")
+        reveal_btn.setFixedWidth(28)
+        reveal_btn.toggled.connect(
+            lambda checked: edit.setEchoMode(QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password)
+        )
+
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        row.addWidget(edit)
+        row.addWidget(reveal_btn)
+        return edit, row
 
     def _build_color_button(self, label: str, field: str, tooltip: str = "") -> QPushButton:
         btn = QPushButton(label)
@@ -353,21 +378,11 @@ class SettingsDialog(QWidget):
         layout.addWidget(creds_label)
 
         creds_form = QFormLayout()
-        self.modal_token_id_edit = QLineEdit(s.modal_token_id)
-        self.modal_token_id_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.modal_token_id_edit.setPlaceholderText("ak-...")
-        self.modal_token_id_edit.editingFinished.connect(
-            lambda: self._update("modal_token_id", self.modal_token_id_edit.text())
-        )
-        creds_form.addRow("Token ID", self.modal_token_id_edit)
+        self.modal_token_id_edit, id_row = self._build_secret_field("ak-...", "modal_token_id", s.modal_token_id)
+        creds_form.addRow("Token ID", id_row)
 
-        self.modal_token_secret_edit = QLineEdit(s.modal_token_secret)
-        self.modal_token_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.modal_token_secret_edit.setPlaceholderText("as-...")
-        self.modal_token_secret_edit.editingFinished.connect(
-            lambda: self._update("modal_token_secret", self.modal_token_secret_edit.text())
-        )
-        creds_form.addRow("Token secret", self.modal_token_secret_edit)
+        self.modal_token_secret_edit, secret_row = self._build_secret_field("as-...", "modal_token_secret", s.modal_token_secret)
+        creds_form.addRow("Token secret", secret_row)
         layout.addLayout(creds_form)
 
         self.modal_status_label = QLabel("")
@@ -509,3 +524,19 @@ class SettingsDialog(QWidget):
             self.close()
         else:
             super().keyPressEvent(event)
+
+    def event(self, event) -> bool:
+        # Closes on a click anywhere outside this panel -- including
+        # another application, the desktop, or the taskbar. An
+        # application-level event filter (the previous approach) only
+        # ever sees events for THIS app's own windows, so a click on
+        # anything else never reached it and the panel stayed open.
+        # WindowDeactivate fires whenever this top-level window loses
+        # focus for any reason, which covers all of those cases uniformly.
+        if event.type() == QEvent.Type.WindowDeactivate and QApplication.activeModalWidget() is None:
+            # The activeModalWidget() guard matters: without it, opening a
+            # QColorDialog from this panel (a separate window, so it
+            # deactivates this one) would close the whole panel the
+            # instant the color picker appeared.
+            self.close()
+        return super().event(event)
