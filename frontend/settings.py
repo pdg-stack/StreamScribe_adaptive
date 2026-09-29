@@ -32,8 +32,11 @@ class Settings:
     persist_subtitles: bool = False  # False: newest caption replaces the last; True: appends, scrollable
     auto_hide_header: bool = False  # hide the toolbar unless the mouse is over the overlay
     auto_hide_footer: bool = False  # hide the advanced pane unless the mouse is over the overlay
-    border_color: str = "#444444"
-    border_thickness: int = 0  # px; 0 = no border
+    # The caption text's own outline -- color and width of the stroke/
+    # frame around the text itself (see overlay_window.py's
+    # _wrap_text_outline), not a background box.
+    outline_color: str = "#444444"
+    outline_width: int = 0  # px; 0 = no outline
     # Modal auth: optional, only needed if the backend container has no
     # ambient `modal token set` credentials of its own (the normal case --
     # Docker doesn't inherit the host's ~/.modal.toml). Left blank, Modal
