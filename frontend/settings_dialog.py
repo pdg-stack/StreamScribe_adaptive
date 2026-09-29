@@ -1,73 +1,455 @@
-"""Settings dialog: font/color/opacity/refresh-speed controls, applied
-live to the overlay and persisted via Settings.save()."""
+"""Settings panel: appearance and model-config controls, applied live to
+the overlay and persisted via Settings.save().
+
+Deliberately a frameless QWidget, not a QDialog/.exec(): the main overlay is
+WindowStaysOnTopHint, so a plain QDialog (no matching stays-on-top flag)
+ends up rendered *behind* it -- unreachable to clicks and looking merged
+into the overlay. This also gets its own WindowStaysOnTopHint, is parented
+to the overlay so it doesn't get an independent taskbar/minimize identity,
+and stays fully opaque. Toggled open/closed by the overlay's gear icon and
+closed on an outside click (see OverlayWindow._toggle_settings_panel).
+
+`actions` bundles the callbacks that reach past styling into the running
+pipeline (engine/tier/latency/Modal setup-stop) -- passed as a dict rather
+than half a dozen separate constructor params, since OverlayWindow is the
+one place that already holds all of them.
+"""
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from collections.abc import Callable
+
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QColorDialog,
-    QDialog,
+    QComboBox,
+    QDoubleSpinBox,
     QFontComboBox,
     QFormLayout,
+    QHBoxLayout,
+    QLabel,
     QPushButton,
+    QRadioButton,
     QSlider,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 from .settings import Settings
+from .toggle_switch import ToggleSwitch
+
+TIER_OPTIONS = [("auto", "Auto"), ("small", "Small"), ("base", "Base"), ("tiny", "Tiny")]
+ENGINE_OPTIONS = [("faster-whisper", "faster-whisper"), ("parakeet", "Parakeet TDT")]
+
+# status -> (dot color, label). Mirrors backend/main.py's modal_setup_status
+# values (see docstring there): deploying -> warming up -> ready -> alive
+# (heartbeat) -> terminated, plus "stopping" (sent client-side the instant
+# Stop is clicked, then confirmed by the backend's own "stopping" ->
+# "terminated" pair -- see _handle_modal_stop / stop_modal in main.py).
+# Labels are the base text; busy states get an animated "..." suffix from
+# _tick_progress so there's visible motion while setup/teardown is in
+# flight, not just a static word.
+MODAL_STATUS_DISPLAY = {
+    "terminated": ("#555555", "Stopped"),
+    "deploying": ("#e0b400", "Starting (deploying)"),
+    "warming up": ("#e0b400", "Starting (warming up)"),
+    "stopping": ("#e0b400", "Stopping"),
+    "ready": ("#3fbf50", "Ready"),
+    "alive": ("#3fbf50", "Alive"),
+}
+BUSY_MODAL_STATUSES = {"deploying", "warming up", "stopping"}
+PROGRESS_TICK_MS = 400
+
+COMBO_STYLE = """
+    QComboBox {
+        color: #eeeeee;
+        background-color: #333333;
+        border: 1px solid #5a5a5a;
+        border-radius: 4px;
+        padding: 3px 6px;
+    }
+    QComboBox:disabled {
+        color: #888888;
+        background-color: #2a2a2a;
+        border: 1px solid #444444;
+    }
+"""
+
+SECTION_LABEL_STYLE = "color: #999999; font-weight: bold; font-size: 11px; margin-top: 8px;"
 
 
-class SettingsDialog(QDialog):
-    def __init__(self, settings: Settings, on_change) -> None:
-        super().__init__()
-        self.setWindowTitle("StreamScribe_fwhisper settings")
+class SettingsDialog(QWidget):
+    def __init__(
+        self,
+        settings: Settings,
+        on_change: Callable[[Settings], None],
+        actions: dict[str, Callable],
+        modal_status: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.settings = settings
         self._on_change = on_change
+        self._actions = actions
 
-        form = QFormLayout()
+        # Animated "..." on the Modal status label while deploying/warming
+        # up/stopping, so there's visible motion during setup/teardown
+        # instead of a label that looks stuck. See set_modal_status.
+        self._modal_status = "terminated"
+        self._status_color = MODAL_STATUS_DISPLAY["terminated"][0]
+        self._status_label_base = MODAL_STATUS_DISPLAY["terminated"][1]
+        self._progress_dots = 0
+        self._progress_timer = QTimer(self)
+        self._progress_timer.timeout.connect(self._tick_progress)
 
+        tabs = QTabWidget()
+        tabs.addTab(self._build_appearance_tab(), "Appearance")
+        tabs.addTab(self._build_model_config_tab(), "Model config")
+        tabs.addTab(self._build_advanced_tab(), "Advanced")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.addWidget(tabs)
+
+        self.set_modal_status(modal_status)
+        self._update_mode_pages()
+
+        self.setStyleSheet(f"""
+            SettingsDialog {{
+                background-color: #262626;
+                border: 1px solid #4a4a4a;
+                border-radius: 10px;
+            }}
+            QLabel {{ color: #eeeeee; }}
+            QTabWidget::pane {{ border: 1px solid #4a4a4a; border-radius: 6px; }}
+            QTabBar::tab {{
+                background: #333333;
+                color: #cccccc;
+                padding: 6px 12px;
+            }}
+            QTabBar::tab:selected {{ background: #444444; color: #ffffff; }}
+            {COMBO_STYLE}
+        """)
+
+    # -- Appearance tab ---------------------------------------------------
+    def _build_appearance_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        s = self.settings
+
+        typography_label = QLabel("Typography")
+        typography_label.setStyleSheet(SECTION_LABEL_STYLE)
+        layout.addWidget(typography_label)
+
+        type_form = QFormLayout()
         self.font_combo = QFontComboBox()
-        self.font_combo.setCurrentFont(self.font_combo.currentFont().__class__(settings.font_family))
+        self.font_combo.setCurrentFont(self.font_combo.currentFont().__class__(s.font_family))
         self.font_combo.currentFontChanged.connect(lambda f: self._update("font_family", f.family()))
-        form.addRow("Font", self.font_combo)
+        type_form.addRow("Font", self.font_combo)
 
         self.size_spin = QSpinBox()
-        self.size_spin.setRange(10, 72)
-        self.size_spin.setValue(settings.font_size)
+        self.size_spin.setRange(8, 72)
+        self.size_spin.setValue(s.font_size)
         self.size_spin.valueChanged.connect(lambda v: self._update("font_size", v))
-        form.addRow("Font size", self.size_spin)
+        type_form.addRow("Size", self.size_spin)
+        layout.addLayout(type_form)
 
-        font_color_btn = QPushButton("Pick font color")
-        font_color_btn.clicked.connect(lambda: self._pick_color("font_color"))
-        form.addRow(font_color_btn)
+        colors_label = QLabel("Caption text")
+        colors_label.setStyleSheet(SECTION_LABEL_STYLE)
+        colors_label.setToolTip(
+            "These style the caption text itself (like YouTube's caption "
+            "settings), not the floating panel behind it."
+        )
+        layout.addWidget(colors_label)
 
-        bg_color_btn = QPushButton("Pick background color")
-        bg_color_btn.clicked.connect(lambda: self._pick_color("background_color"))
-        form.addRow(bg_color_btn)
+        color_row = QHBoxLayout()
+        self.font_color_btn = self._build_color_button("Font", "font_color", "Caption text color")
+        self.bg_color_btn = self._build_color_button(
+            "Background", "background_color",
+            "Highlight box directly behind the caption text (YouTube-style) -- not the overlay panel."
+        )
+        self.border_color_btn = self._build_color_button(
+            "Border", "border_color", "Outline color around the caption text box."
+        )
+        color_row.addWidget(self.font_color_btn)
+        color_row.addWidget(self.bg_color_btn)
+        color_row.addWidget(self.border_color_btn)
+        layout.addLayout(color_row)
 
+        border_form = QFormLayout()
+        self.border_thickness_spin = QSpinBox()
+        self.border_thickness_spin.setRange(0, 10)
+        self.border_thickness_spin.setSuffix(" px")
+        self.border_thickness_spin.setValue(s.border_thickness)
+        self.border_thickness_spin.setToolTip("Outline thickness around the caption text box, in pixels (0 = no outline).")
+        self.border_thickness_spin.valueChanged.connect(lambda v: self._update("border_thickness", v))
+        border_form.addRow("Text border thickness", self.border_thickness_spin)
+        layout.addLayout(border_form)
+
+        display_label = QLabel("Display")
+        display_label.setStyleSheet(SECTION_LABEL_STYLE)
+        layout.addWidget(display_label)
+
+        display_form = QFormLayout()
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(0, 100)
-        self.opacity_slider.setValue(settings.background_opacity)
+        self.opacity_slider.setValue(s.background_opacity)
+        self.opacity_slider.setToolTip("Opacity of the caption text's background highlight, not the overlay panel.")
         self.opacity_slider.valueChanged.connect(lambda v: self._update("background_opacity", v))
-        form.addRow("Background opacity", self.opacity_slider)
+        display_form.addRow("Text background opacity", self.opacity_slider)
+        layout.addLayout(display_form)
 
+        layout.addStretch(1)
+        return page
+
+    def _build_color_button(self, label: str, field: str, tooltip: str = "") -> QPushButton:
+        btn = QPushButton(label)
+        btn.setObjectName("colorButton")
+        if tooltip:
+            btn.setToolTip(tooltip)
+        self._paint_color_button(btn, getattr(self.settings, field))
+        btn.clicked.connect(lambda: self._pick_color(field, btn))
+        return btn
+
+    @staticmethod
+    def _paint_color_button(btn: QPushButton, hex_color: str) -> None:
+        text_color = "#000000" if QColor(hex_color).lightnessF() > 0.5 else "#ffffff"
+        btn.setStyleSheet(
+            f"QPushButton#colorButton {{"
+            f"  background-color: {hex_color}; color: {text_color};"
+            f"  border: 1px solid #666666; border-radius: 4px; padding: 6px;"
+            f"}}"
+        )
+
+    # -- Advanced tab -------------------------------------------------------
+    def _build_advanced_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        s = self.settings
+
+        form = QFormLayout()
         self.refresh_spin = QSpinBox()
         self.refresh_spin.setRange(100, 5000)
         self.refresh_spin.setSingleStep(100)
-        self.refresh_spin.setValue(settings.refresh_speed_ms)
+        self.refresh_spin.setValue(s.refresh_speed_ms)
         self.refresh_spin.valueChanged.connect(lambda v: self._update("refresh_speed_ms", v))
         form.addRow("Subtitle refresh speed (ms)", self.refresh_spin)
-
-        layout = QVBoxLayout(self)
         layout.addLayout(form)
 
+        self.advanced_toggle = self._add_toggle_row(
+            layout, "Show advanced diagnostics under the caption", s.advanced_mode, "advanced_mode"
+        )
+        self.persist_toggle = self._add_toggle_row(
+            layout,
+            "Persist subtitles (append instead of replace)",
+            s.persist_subtitles,
+            "persist_subtitles",
+            tooltip="On: new subtitles append below older ones, scrollable.\nOff: each new subtitle replaces the last one shown.",
+        )
+        self.auto_hide_header_toggle = self._add_toggle_row(
+            layout, "Auto-hide header (show on hover)", s.auto_hide_header, "auto_hide_header"
+        )
+        self.auto_hide_footer_toggle = self._add_toggle_row(
+            layout, "Auto-hide footer (show on hover)", s.auto_hide_footer, "auto_hide_footer"
+        )
+
+        layout.addStretch(1)
+        return page
+
+    def _add_toggle_row(self, layout: QVBoxLayout, label: str, checked: bool, field: str, tooltip: str = "") -> ToggleSwitch:
+        row = QHBoxLayout()
+        toggle = ToggleSwitch()
+        toggle.setChecked(checked)
+        toggle.toggled.connect(lambda v: self._update(field, v))
+        text = QLabel(label)
+        if tooltip:
+            text.setToolTip(tooltip)
+            toggle.setToolTip(tooltip)
+        row.addWidget(toggle)
+        row.addWidget(text)
+        row.addStretch(1)
+        layout.addLayout(row)
+        return toggle
+
+    # -- Model config tab ---------------------------------------------------
+    def _build_model_config_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        s = self.settings
+
+        form = QFormLayout()
+        self.latency_spin = QDoubleSpinBox()
+        self.latency_spin.setRange(1, 20)
+        self.latency_spin.setSingleStep(1)
+        self.latency_spin.setSuffix(" s")
+        self.latency_spin.setValue(s.acceptable_latency_s)
+        self.latency_spin.valueChanged.connect(self._handle_latency_change)
+        form.addRow("Acceptable delay", self.latency_spin)
+        layout.addLayout(form)
+
+        radio_row = QHBoxLayout()
+        self.local_radio = QRadioButton("Local")
+        self.cloud_radio = QRadioButton("Cloud (Modal.com GPU)")
+        self.cloud_radio.setChecked(s.inference_mode == "modal")
+        self.local_radio.setChecked(s.inference_mode != "modal")
+        self.local_radio.toggled.connect(self._handle_inference_mode_change)
+        radio_row.addWidget(self.local_radio)
+        radio_row.addWidget(self.cloud_radio)
+        radio_row.addStretch(1)
+        layout.addLayout(radio_row)
+
+        layout.addWidget(self._build_local_page())
+        layout.addWidget(self._build_cloud_page())
+        layout.addStretch(1)
+        return page
+
+    def _build_local_page(self) -> QWidget:
+        self.local_page = QWidget()
+        form = QFormLayout(self.local_page)
+        s = self.settings
+
+        self.engine_combo = QComboBox()
+        for code, name in ENGINE_OPTIONS:
+            self.engine_combo.addItem(name, userData=code)
+        self._set_combo_code(self.engine_combo, s.engine)
+        self.engine_combo.currentIndexChanged.connect(self._handle_engine_change)
+        form.addRow("Engine", self.engine_combo)
+
+        self.tier_combo = QComboBox()
+        for code, name in TIER_OPTIONS:
+            self.tier_combo.addItem(name, userData=code)
+        self._set_combo_code(self.tier_combo, s.tier)
+        self.tier_combo.currentIndexChanged.connect(self._handle_tier_change)
+        form.addRow("Model size", self.tier_combo)
+
+        self._update_tier_enabled()
+        return self.local_page
+
+    def _build_cloud_page(self) -> QWidget:
+        self.cloud_page = QWidget()
+        layout = QVBoxLayout(self.cloud_page)
+        layout.setContentsMargins(0, 4, 0, 0)
+
+        self.modal_status_label = QLabel("")
+        layout.addWidget(self.modal_status_label)
+
+        self.modal_setup_btn = QPushButton("Set up Modal instance")
+        self.modal_setup_btn.clicked.connect(self._handle_modal_setup)
+        layout.addWidget(self.modal_setup_btn)
+
+        self.modal_stop_btn = QPushButton("Stop")
+        self.modal_stop_btn.clicked.connect(self._handle_modal_stop)
+        layout.addWidget(self.modal_stop_btn)
+
+        return self.cloud_page
+
+    # -- live updates from the backend (modal_setup_status events) --------
+    def set_modal_status(self, status: str) -> None:
+        self._modal_status = status
+        self._status_color, self._status_label_base = MODAL_STATUS_DISPLAY.get(
+            status, MODAL_STATUS_DISPLAY["terminated"]
+        )
+        is_busy = status in BUSY_MODAL_STATUSES
+        if is_busy and not self._progress_timer.isActive():
+            self._progress_dots = 0
+            self._progress_timer.start(PROGRESS_TICK_MS)
+        elif not is_busy:
+            self._progress_timer.stop()
+        self._refresh_modal_status_text()
+
+        # Setup only from a fully stopped state; Stop only once Modal is
+        # actually usable (not mid-setup/mid-teardown) -- avoids racing a
+        # second setup/stop request against one already in flight.
+        self.modal_setup_btn.setEnabled(status == "terminated")
+        self.modal_setup_btn.setText("Setting up..." if is_busy and status != "stopping" else "Set up Modal instance")
+        self.modal_stop_btn.setEnabled(status in ("ready", "alive"))
+        self.modal_stop_btn.setText("Stopping..." if status == "stopping" else "Stop")
+
+    def _refresh_modal_status_text(self) -> None:
+        dots = "." * (self._progress_dots % 4) if self._modal_status in BUSY_MODAL_STATUSES else ""
+        self.modal_status_label.setText(f"● {self._status_label_base}{dots}")
+        self.modal_status_label.setStyleSheet(f"color: {self._status_color};")
+
+    def _tick_progress(self) -> None:
+        self._progress_dots += 1
+        self._refresh_modal_status_text()
+
+    # -- internals -----------------------------------------------------------
     def _update(self, field: str, value) -> None:
         setattr(self.settings, field, value)
         self.settings.save()
         self._on_change(self.settings)
 
-    def _pick_color(self, field: str) -> None:
-        color = QColorDialog.getColor()
+    def _pick_color(self, field: str, btn: QPushButton) -> None:
+        initial = QColor(getattr(self.settings, field))
+        color = QColorDialog.getColor(initial, self)
         if color.isValid():
             self._update(field, color.name())
+            self._paint_color_button(btn, color.name())
+
+    def _update_tier_enabled(self) -> None:
+        self.tier_combo.setEnabled(self.engine_combo.currentData() == "faster-whisper")
+
+    def _update_mode_pages(self) -> None:
+        is_cloud = self.cloud_radio.isChecked()
+        self.local_page.setVisible(not is_cloud)
+        self.cloud_page.setVisible(is_cloud)
+
+    def _handle_engine_change(self, index: int) -> None:
+        code = self.engine_combo.itemData(index)
+        self._update("engine", code)
+        self._update_tier_enabled()
+        self._actions["on_engine_change"](code)
+
+    def _handle_tier_change(self, index: int) -> None:
+        code = self.tier_combo.itemData(index)
+        self._update("tier", code)
+        self._actions["on_tier_change"](code)
+
+    def _handle_latency_change(self, value: float) -> None:
+        self._update("acceptable_latency_s", value)
+        self._actions["on_latency_change"](value)
+
+    def _handle_inference_mode_change(self, local_checked: bool) -> None:
+        mode = "local" if local_checked else "modal"
+        self._update("inference_mode", mode)
+        self._update_mode_pages()
+        if mode == "modal":
+            # Modal only runs faster-whisper (see plan) -- force the engine
+            # choice so there's nothing to silently route around.
+            self._set_combo_code(self.engine_combo, "faster-whisper")
+        else:
+            self._actions["on_modal_stop_requested"]()
+
+    def _handle_modal_setup(self) -> None:
+        # Optimistic: show progress immediately rather than waiting for the
+        # round trip (control message -> backend -> to_thread deploy call
+        # -> its own first on_status("deploying") -> event back over the
+        # WebSocket) before anything visibly happens.
+        self.set_modal_status("deploying")
+        self._actions["on_modal_setup_requested"]()
+
+    def _handle_modal_stop(self) -> None:
+        self.set_modal_status("stopping")
+        self._actions["on_modal_stop_requested"]()
+
+    @staticmethod
+    def _set_combo_code(combo: QComboBox, code: str) -> None:
+        idx = combo.findData(code)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
