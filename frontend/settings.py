@@ -6,7 +6,7 @@ persisted to a JSON file next to this app so it survives restarts.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 PREFS_PATH = Path(__file__).parent / "user_prefs.json"
@@ -32,11 +32,22 @@ class Settings:
     persist_subtitles: bool = False  # False: newest caption replaces the last; True: appends, scrollable
     auto_hide_header: bool = False  # hide the toolbar unless the mouse is over the overlay
     auto_hide_footer: bool = False  # hide the advanced pane unless the mouse is over the overlay
-    # The caption text's own outline -- color and width of the stroke/
-    # frame around the text itself (see overlay_window.py's
-    # _wrap_text_outline), not a background box.
+    # The caption text's own outline -- a stroke that follows the actual
+    # shape of the glyphs (see caption_view.py), like a font's own outline,
+    # not a border drawn around a bounding box.
     outline_color: str = "#444444"
     outline_width: int = 0  # px; 0 = no outline
+    # A highlight rectangle sized to each caption line, independent of
+    # both the outline above and background_color/opacity below (the app
+    # window's own panel translucency) -- e.g. YouTube's per-line caption
+    # background. Colors may carry alpha (#AARRGGBB) from the color
+    # picker's transparency option; 0 opacity here means no box at all.
+    font_background_color: str = "#000000"
+    font_background_opacity: int = 0  # 0-100; 0 = no background box
+    # Recently used colors (hex, #RRGGBB or #AARRGGBB), most-recent first
+    # -- restores QColorDialog's custom-color swatches across restarts
+    # (its own built-in memory is process-lifetime only).
+    custom_colors: list[str] = field(default_factory=list)
     # Modal auth: optional, only needed if the backend container has no
     # ambient `modal token set` credentials of its own (the normal case --
     # Docker doesn't inherit the host's ~/.modal.toml). Left blank, Modal
