@@ -34,6 +34,16 @@ class Settings:
     auto_hide_footer: bool = False  # hide the advanced pane unless the mouse is over the overlay
     border_color: str = "#444444"
     border_thickness: int = 0  # px; 0 = no border
+    # Modal auth: optional, only needed if the backend container has no
+    # ambient `modal token set` credentials of its own (the normal case --
+    # Docker doesn't inherit the host's ~/.modal.toml). Left blank, Modal
+    # setup falls back to whatever ambient auth the container happens to
+    # have. Get these from modal.com -> Settings -> API Tokens. Stored
+    # in this plaintext local prefs file like every other setting here --
+    # there's no secrets vault in this app, so treat this file as
+    # sensitive once a token's been entered.
+    modal_token_id: str = ""
+    modal_token_secret: str = ""
 
     @classmethod
     def load(cls) -> "Settings":

@@ -59,8 +59,8 @@ class WsClient:
     def set_acceptable_latency(self, seconds: float) -> None:
         self._control_queue.put({"type": "set_acceptable_latency", "seconds": seconds})
 
-    def start_modal_setup(self) -> None:
-        self._control_queue.put({"type": "start_modal_setup"})
+    def start_modal_setup(self, token_id: str = "", token_secret: str = "") -> None:
+        self._control_queue.put({"type": "start_modal_setup", "token_id": token_id, "token_secret": token_secret})
 
     def stop_modal(self) -> None:
         self._control_queue.put({"type": "stop_modal"})

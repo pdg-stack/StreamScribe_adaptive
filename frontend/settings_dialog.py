@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QRadioButton,
     QSlider,
@@ -163,25 +164,19 @@ class SettingsDialog(QWidget):
         type_form.addRow("Size", self.size_spin)
         layout.addLayout(type_form)
 
-        colors_label = QLabel("Caption text")
-        colors_label.setStyleSheet(SECTION_LABEL_STYLE)
-        colors_label.setToolTip(
-            "These style the caption text itself (like YouTube's caption "
-            "settings), not the floating panel behind it."
-        )
-        layout.addWidget(colors_label)
+        text_label = QLabel("Caption text")
+        text_label.setStyleSheet(SECTION_LABEL_STYLE)
+        text_label.setToolTip("The caption text itself -- its fill color and the border/outline framing it.")
+        layout.addWidget(text_label)
 
         color_row = QHBoxLayout()
-        self.font_color_btn = self._build_color_button("Font", "font_color", "Caption text color")
-        self.bg_color_btn = self._build_color_button(
-            "Background", "background_color",
-            "Highlight box directly behind the caption text (YouTube-style) -- not the overlay panel."
-        )
+        self.font_color_btn = self._build_color_button("Font", "font_color", "Caption text color.")
         self.border_color_btn = self._build_color_button(
-            "Border", "border_color", "Outline color around the caption text box."
+            "Border", "border_color",
+            "Border color around the caption text itself -- helps the text stand out when "
+            "font color and whatever's behind it are close in color."
         )
         color_row.addWidget(self.font_color_btn)
-        color_row.addWidget(self.bg_color_btn)
         color_row.addWidget(self.border_color_btn)
         layout.addLayout(color_row)
 
@@ -190,22 +185,29 @@ class SettingsDialog(QWidget):
         self.border_thickness_spin.setRange(0, 10)
         self.border_thickness_spin.setSuffix(" px")
         self.border_thickness_spin.setValue(s.border_thickness)
-        self.border_thickness_spin.setToolTip("Outline thickness around the caption text box, in pixels (0 = no outline).")
+        self.border_thickness_spin.setToolTip("Border thickness around the caption text, in pixels (0 = no border).")
         self.border_thickness_spin.valueChanged.connect(lambda v: self._update("border_thickness", v))
         border_form.addRow("Text border thickness", self.border_thickness_spin)
         layout.addLayout(border_form)
 
-        display_label = QLabel("Display")
-        display_label.setStyleSheet(SECTION_LABEL_STYLE)
-        layout.addWidget(display_label)
+        window_label = QLabel("App window")
+        window_label.setStyleSheet(SECTION_LABEL_STYLE)
+        window_label.setToolTip("The floating overlay panel behind the caption text -- its background color and opacity.")
+        layout.addWidget(window_label)
+
+        window_row = QHBoxLayout()
+        self.bg_color_btn = self._build_color_button("Background", "background_color", "Overlay panel background color.")
+        window_row.addWidget(self.bg_color_btn)
+        window_row.addStretch(1)
+        layout.addLayout(window_row)
 
         display_form = QFormLayout()
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(0, 100)
         self.opacity_slider.setValue(s.background_opacity)
-        self.opacity_slider.setToolTip("Opacity of the caption text's background highlight, not the overlay panel.")
+        self.opacity_slider.setToolTip("Opacity of the overlay panel's background.")
         self.opacity_slider.valueChanged.connect(lambda v: self._update("background_opacity", v))
-        display_form.addRow("Text background opacity", self.opacity_slider)
+        display_form.addRow("Window background opacity", self.opacity_slider)
         layout.addLayout(display_form)
 
         layout.addStretch(1)
@@ -338,9 +340,44 @@ class SettingsDialog(QWidget):
         self.cloud_page = QWidget()
         layout = QVBoxLayout(self.cloud_page)
         layout.setContentsMargins(0, 4, 0, 0)
+        s = self.settings
+
+        creds_label = QLabel("Modal API credentials (optional)")
+        creds_label.setStyleSheet(SECTION_LABEL_STYLE)
+        creds_label.setToolTip(
+            "Only needed if the backend container has no ambient Modal CLI login of its own -- "
+            "the normal case, since Docker doesn't inherit the host's `modal token set`. "
+            "Get these from modal.com -> Settings -> API Tokens. Left blank, setup falls back to "
+            "whatever ambient auth the container happens to have."
+        )
+        layout.addWidget(creds_label)
+
+        creds_form = QFormLayout()
+        self.modal_token_id_edit = QLineEdit(s.modal_token_id)
+        self.modal_token_id_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.modal_token_id_edit.setPlaceholderText("ak-...")
+        self.modal_token_id_edit.editingFinished.connect(
+            lambda: self._update("modal_token_id", self.modal_token_id_edit.text())
+        )
+        creds_form.addRow("Token ID", self.modal_token_id_edit)
+
+        self.modal_token_secret_edit = QLineEdit(s.modal_token_secret)
+        self.modal_token_secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.modal_token_secret_edit.setPlaceholderText("as-...")
+        self.modal_token_secret_edit.editingFinished.connect(
+            lambda: self._update("modal_token_secret", self.modal_token_secret_edit.text())
+        )
+        creds_form.addRow("Token secret", self.modal_token_secret_edit)
+        layout.addLayout(creds_form)
 
         self.modal_status_label = QLabel("")
         layout.addWidget(self.modal_status_label)
+
+        self.modal_error_label = QLabel("")
+        self.modal_error_label.setWordWrap(True)
+        self.modal_error_label.setStyleSheet("color: #e0392b; font-size: 11px;")
+        self.modal_error_label.setVisible(False)
+        layout.addWidget(self.modal_error_label)
 
         self.modal_setup_btn = QPushButton("Set up Modal instance")
         self.modal_setup_btn.clicked.connect(self._handle_modal_setup)
@@ -353,7 +390,7 @@ class SettingsDialog(QWidget):
         return self.cloud_page
 
     # -- live updates from the backend (modal_setup_status events) --------
-    def set_modal_status(self, status: str) -> None:
+    def set_modal_status(self, status: str, error: str | None = None) -> None:
         self._modal_status = status
         self._status_color, self._status_label_base = MODAL_STATUS_DISPLAY.get(
             status, MODAL_STATUS_DISPLAY["terminated"]
@@ -365,6 +402,15 @@ class SettingsDialog(QWidget):
         elif not is_busy:
             self._progress_timer.stop()
         self._refresh_modal_status_text()
+
+        # A fresh setup/stop attempt (is_busy) clears any previous error
+        # rather than leaving it showing next to a status that's since
+        # moved on.
+        if error:
+            self.modal_error_label.setText(f"Setup failed: {error}")
+            self.modal_error_label.setVisible(True)
+        elif is_busy:
+            self.modal_error_label.setVisible(False)
 
         # Setup only from a fully stopped state; Stop only once Modal is
         # actually usable (not mid-setup/mid-teardown) -- avoids racing a
@@ -431,12 +477,22 @@ class SettingsDialog(QWidget):
             self._actions["on_modal_stop_requested"]()
 
     def _handle_modal_setup(self) -> None:
+        # Read the fields directly rather than relying on editingFinished
+        # having already synced self.settings -- correct in practice
+        # (clicking this button focus-outs the line edits first), but not
+        # worth depending on. Also updates settings/persists here as a
+        # backstop for the same reason.
+        token_id = self.modal_token_id_edit.text()
+        token_secret = self.modal_token_secret_edit.text()
+        self._update("modal_token_id", token_id)
+        self._update("modal_token_secret", token_secret)
+
         # Optimistic: show progress immediately rather than waiting for the
         # round trip (control message -> backend -> to_thread deploy call
         # -> its own first on_status("deploying") -> event back over the
         # WebSocket) before anything visibly happens.
         self.set_modal_status("deploying")
-        self._actions["on_modal_setup_requested"]()
+        self._actions["on_modal_setup_requested"](token_id, token_secret)
 
     def _handle_modal_stop(self) -> None:
         self.set_modal_status("stopping")

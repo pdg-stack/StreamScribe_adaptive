@@ -67,9 +67,9 @@ def main() -> None:
         print(f"[Engine] model size set to: {tier}", flush=True)
         ws_client.set_tier(tier)
 
-    def on_modal_setup_requested() -> None:
+    def on_modal_setup_requested(token_id: str, token_secret: str) -> None:
         print("[Modal] setup requested...", flush=True)
-        ws_client.start_modal_setup()
+        ws_client.start_modal_setup(token_id, token_secret)
 
     def on_modal_stop_requested() -> None:
         print("[Modal] stop requested...", flush=True)
