@@ -42,17 +42,38 @@ def main() -> None:
         print("StreamScribe_adaptive is already running -- close it first.")
         sys.exit(1)
 
+    print("[App] StreamScribe_adaptive starting...", flush=True)
+
     app = QApplication(sys.argv)
     settings = Settings.load()
     bridge = _EventBridge()
 
-    ws_client = WsClient(on_event=bridge.event_received.emit)
+    def on_connection_change(connected: bool) -> None:
+        print(f"[Backend] {'connected' if connected else 'disconnected -- retrying...'}", flush=True)
+
+    ws_client = WsClient(on_event=bridge.event_received.emit, on_connection_change=on_connection_change)
 
     def on_src_lang_change(code: str) -> None:
         ws_client.set_src_lang(code)
 
     def on_dest_lang_change(code: str) -> None:
         ws_client.set_dst_lang(code)
+
+    def on_engine_change(engine: str) -> None:
+        print(f"[Engine] switched to: {engine}", flush=True)
+        ws_client.set_engine(engine)
+
+    def on_tier_change(tier: str) -> None:
+        print(f"[Engine] model size set to: {tier}", flush=True)
+        ws_client.set_tier(tier)
+
+    def on_modal_setup_requested() -> None:
+        print("[Modal] setup requested...", flush=True)
+        ws_client.start_modal_setup()
+
+    def on_modal_stop_requested() -> None:
+        print("[Modal] stop requested...", flush=True)
+        ws_client.stop_modal()
 
     # A single mutable attribute, read on PortAudio's own capture thread and
     # written from the Qt thread on a button click -- CPython's GIL makes a
@@ -75,11 +96,11 @@ def main() -> None:
         on_src_lang_change=on_src_lang_change,
         on_dest_lang_change=on_dest_lang_change,
         on_close=app.quit,
-        on_engine_change=ws_client.set_engine,
-        on_tier_change=ws_client.set_tier,
+        on_engine_change=on_engine_change,
+        on_tier_change=on_tier_change,
         on_latency_change=ws_client.set_acceptable_latency,
-        on_modal_setup_requested=ws_client.start_modal_setup,
-        on_modal_stop_requested=ws_client.stop_modal,
+        on_modal_setup_requested=on_modal_setup_requested,
+        on_modal_stop_requested=on_modal_stop_requested,
         on_pause_toggled=on_pause_toggled,
     )
     bridge.event_received.connect(overlay.handle_event)
@@ -101,9 +122,14 @@ def main() -> None:
     source_timer.timeout.connect(lambda: overlay.set_source_app(active_source_process()))
     source_timer.start(SOURCE_POLL_MS)
 
+    def on_app_quit() -> None:
+        print("[App] StreamScribe_adaptive closing...", flush=True)
+
+    app.aboutToQuit.connect(on_app_quit)
     app.aboutToQuit.connect(capture.stop)
     app.aboutToQuit.connect(ws_client.stop)
 
+    print("[App] StreamScribe_adaptive started -- overlay is up, listening for system audio.", flush=True)
     sys.exit(app.exec())
 
 

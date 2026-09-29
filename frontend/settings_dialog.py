@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QColorDialog,
@@ -46,14 +46,22 @@ ENGINE_OPTIONS = [("faster-whisper", "faster-whisper"), ("parakeet", "Parakeet T
 
 # status -> (dot color, label). Mirrors backend/main.py's modal_setup_status
 # values (see docstring there): deploying -> warming up -> ready -> alive
-# (heartbeat) -> terminated.
+# (heartbeat) -> terminated, plus "stopping" (sent client-side the instant
+# Stop is clicked, then confirmed by the backend's own "stopping" ->
+# "terminated" pair -- see _handle_modal_stop / stop_modal in main.py).
+# Labels are the base text; busy states get an animated "..." suffix from
+# _tick_progress so there's visible motion while setup/teardown is in
+# flight, not just a static word.
 MODAL_STATUS_DISPLAY = {
-    "terminated": ("#555555", "Not running"),
-    "deploying": ("#e0b400", "Deploying..."),
-    "warming up": ("#e0b400", "Warming up..."),
+    "terminated": ("#555555", "Stopped"),
+    "deploying": ("#e0b400", "Starting (deploying)"),
+    "warming up": ("#e0b400", "Starting (warming up)"),
+    "stopping": ("#e0b400", "Stopping"),
     "ready": ("#3fbf50", "Ready"),
     "alive": ("#3fbf50", "Alive"),
 }
+BUSY_MODAL_STATUSES = {"deploying", "warming up", "stopping"}
+PROGRESS_TICK_MS = 400
 
 COMBO_STYLE = """
     QComboBox {
@@ -92,6 +100,16 @@ class SettingsDialog(QWidget):
         self.settings = settings
         self._on_change = on_change
         self._actions = actions
+
+        # Animated "..." on the Modal status label while deploying/warming
+        # up/stopping, so there's visible motion during setup/teardown
+        # instead of a label that looks stuck. See set_modal_status.
+        self._modal_status = "terminated"
+        self._status_color = MODAL_STATUS_DISPLAY["terminated"][0]
+        self._status_label_base = MODAL_STATUS_DISPLAY["terminated"][1]
+        self._progress_dots = 0
+        self._progress_timer = QTimer(self)
+        self._progress_timer.timeout.connect(self._tick_progress)
 
         tabs = QTabWidget()
         tabs.addTab(self._build_appearance_tab(), "Appearance")
@@ -145,14 +163,23 @@ class SettingsDialog(QWidget):
         type_form.addRow("Size", self.size_spin)
         layout.addLayout(type_form)
 
-        colors_label = QLabel("Colors")
+        colors_label = QLabel("Caption text")
         colors_label.setStyleSheet(SECTION_LABEL_STYLE)
+        colors_label.setToolTip(
+            "These style the caption text itself (like YouTube's caption "
+            "settings), not the floating panel behind it."
+        )
         layout.addWidget(colors_label)
 
         color_row = QHBoxLayout()
-        self.font_color_btn = self._build_color_button("Font", "font_color")
-        self.bg_color_btn = self._build_color_button("Background", "background_color")
-        self.border_color_btn = self._build_color_button("Border", "border_color")
+        self.font_color_btn = self._build_color_button("Font", "font_color", "Caption text color")
+        self.bg_color_btn = self._build_color_button(
+            "Background", "background_color",
+            "Highlight box directly behind the caption text (YouTube-style) -- not the overlay panel."
+        )
+        self.border_color_btn = self._build_color_button(
+            "Border", "border_color", "Outline color around the caption text box."
+        )
         color_row.addWidget(self.font_color_btn)
         color_row.addWidget(self.bg_color_btn)
         color_row.addWidget(self.border_color_btn)
@@ -163,8 +190,9 @@ class SettingsDialog(QWidget):
         self.border_thickness_spin.setRange(0, 10)
         self.border_thickness_spin.setSuffix(" px")
         self.border_thickness_spin.setValue(s.border_thickness)
+        self.border_thickness_spin.setToolTip("Outline thickness around the caption text box, in pixels (0 = no outline).")
         self.border_thickness_spin.valueChanged.connect(lambda v: self._update("border_thickness", v))
-        border_form.addRow("Border thickness", self.border_thickness_spin)
+        border_form.addRow("Text border thickness", self.border_thickness_spin)
         layout.addLayout(border_form)
 
         display_label = QLabel("Display")
@@ -175,16 +203,19 @@ class SettingsDialog(QWidget):
         self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(0, 100)
         self.opacity_slider.setValue(s.background_opacity)
+        self.opacity_slider.setToolTip("Opacity of the caption text's background highlight, not the overlay panel.")
         self.opacity_slider.valueChanged.connect(lambda v: self._update("background_opacity", v))
-        display_form.addRow("Background opacity", self.opacity_slider)
+        display_form.addRow("Text background opacity", self.opacity_slider)
         layout.addLayout(display_form)
 
         layout.addStretch(1)
         return page
 
-    def _build_color_button(self, label: str, field: str) -> QPushButton:
+    def _build_color_button(self, label: str, field: str, tooltip: str = "") -> QPushButton:
         btn = QPushButton(label)
         btn.setObjectName("colorButton")
+        if tooltip:
+            btn.setToolTip(tooltip)
         self._paint_color_button(btn, getattr(self.settings, field))
         btn.clicked.connect(lambda: self._pick_color(field, btn))
         return btn
@@ -323,11 +354,34 @@ class SettingsDialog(QWidget):
 
     # -- live updates from the backend (modal_setup_status events) --------
     def set_modal_status(self, status: str) -> None:
-        color, label = MODAL_STATUS_DISPLAY.get(status, MODAL_STATUS_DISPLAY["terminated"])
-        self.modal_status_label.setText(f"● {label}")
-        self.modal_status_label.setStyleSheet(f"color: {color};")
+        self._modal_status = status
+        self._status_color, self._status_label_base = MODAL_STATUS_DISPLAY.get(
+            status, MODAL_STATUS_DISPLAY["terminated"]
+        )
+        is_busy = status in BUSY_MODAL_STATUSES
+        if is_busy and not self._progress_timer.isActive():
+            self._progress_dots = 0
+            self._progress_timer.start(PROGRESS_TICK_MS)
+        elif not is_busy:
+            self._progress_timer.stop()
+        self._refresh_modal_status_text()
+
+        # Setup only from a fully stopped state; Stop only once Modal is
+        # actually usable (not mid-setup/mid-teardown) -- avoids racing a
+        # second setup/stop request against one already in flight.
         self.modal_setup_btn.setEnabled(status == "terminated")
-        self.modal_stop_btn.setEnabled(status in ("deploying", "warming up", "ready", "alive"))
+        self.modal_setup_btn.setText("Setting up..." if is_busy and status != "stopping" else "Set up Modal instance")
+        self.modal_stop_btn.setEnabled(status in ("ready", "alive"))
+        self.modal_stop_btn.setText("Stopping..." if status == "stopping" else "Stop")
+
+    def _refresh_modal_status_text(self) -> None:
+        dots = "." * (self._progress_dots % 4) if self._modal_status in BUSY_MODAL_STATUSES else ""
+        self.modal_status_label.setText(f"● {self._status_label_base}{dots}")
+        self.modal_status_label.setStyleSheet(f"color: {self._status_color};")
+
+    def _tick_progress(self) -> None:
+        self._progress_dots += 1
+        self._refresh_modal_status_text()
 
     # -- internals -----------------------------------------------------------
     def _update(self, field: str, value) -> None:
@@ -377,10 +431,15 @@ class SettingsDialog(QWidget):
             self._actions["on_modal_stop_requested"]()
 
     def _handle_modal_setup(self) -> None:
-        self.modal_setup_btn.setEnabled(False)
+        # Optimistic: show progress immediately rather than waiting for the
+        # round trip (control message -> backend -> to_thread deploy call
+        # -> its own first on_status("deploying") -> event back over the
+        # WebSocket) before anything visibly happens.
+        self.set_modal_status("deploying")
         self._actions["on_modal_setup_requested"]()
 
     def _handle_modal_stop(self) -> None:
+        self.set_modal_status("stopping")
         self._actions["on_modal_stop_requested"]()
 
     @staticmethod

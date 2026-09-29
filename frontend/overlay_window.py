@@ -15,7 +15,7 @@ import html
 import time
 
 from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer
-from PyQt6.QtGui import QColor, QCursor, QFont, QMouseEvent, QTextCursor
+from PyQt6.QtGui import QColor, QCursor, QFont, QMouseEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -126,8 +126,13 @@ class OverlayWindow(QWidget):
         self._last_queue_length = 0
         self._last_known_engine = settings.engine
         self._last_partial_update = 0.0
-        self._caption_entries: list[str] = []  # finalized entries (see _format_entry_html)
-        self._current_partial_html = ""
+        # Raw content, not pre-rendered HTML: _format_entry_html() renders
+        # each entry fresh at *render* time (every _render_caption_view()
+        # call), so a live style change (font/background/border color)
+        # repaints existing lines immediately instead of only affecting
+        # whatever caption arrives next.
+        self._caption_entries: list[dict] = []  # finalized entries
+        self._current_partial_entry: dict | None = None
         self._drag_offset: QPoint | None = None
         self._is_hovering = False
 
@@ -328,7 +333,10 @@ class OverlayWindow(QWidget):
     def handle_event(self, event: dict) -> None:
         kind = event.get("type")
         if kind == "modal_setup_status":
-            self.modal_status = event.get("status", "terminated")
+            new_status = event.get("status", "terminated")
+            if new_status != self.modal_status:
+                print(f"[Modal] status: {self.modal_status} -> {new_status}", flush=True)
+            self.modal_status = new_status
             if self._settings_panel is not None:
                 self._settings_panel.set_modal_status(self.modal_status)
             self._update_advanced_pane()
@@ -348,7 +356,10 @@ class OverlayWindow(QWidget):
             return
 
         self._set_status(event.get("cpu_status", "off"))
-        self._current_tier = event.get("model_tier", "")
+        new_tier = event.get("model_tier", "")
+        if new_tier and new_tier != self._current_tier:
+            print(f"[Engine] model tier: {self._current_tier or '(none)'} -> {new_tier}", flush=True)
+        self._current_tier = new_tier
         self._update_advanced_pane()
 
         detected = event.get("detected_lang")
@@ -393,12 +404,12 @@ class OverlayWindow(QWidget):
             self._last_result_at = time.time()  # start a fresh window instead of re-showing every tick
 
     def _show_delayed_marker(self) -> None:
-        marker_html = f'<div style="color:{self.settings.font_color}; font-style: italic;">&lt;delayed&gt;</div>'
+        marker = {"marker": "delayed"}
         if self.settings.persist_subtitles:
-            self._caption_entries.append(marker_html)
+            self._caption_entries.append(marker)
         else:
-            self._caption_entries = [marker_html]
-        self._current_partial_html = ""
+            self._caption_entries = [marker]
+        self._current_partial_entry = None
         self._render_caption_view()
 
     def apply_settings(self, settings: Settings) -> None:
@@ -472,54 +483,103 @@ class OverlayWindow(QWidget):
         self.advanced_queue_label.setText(f"Queue: {self._last_queue_length}")
         self.advanced_delay_label.setText(f"Delay: {self.settings.acceptable_latency_s:g}s")
         self.advanced_app_label.setText(f"Source: {self._current_source_app or '—'}")
-        is_cloud = self.modal_status in ("ready", "alive")
-        self.advanced_host_label.setText(f"Host: {'Cloud (Modal)' if is_cloud else 'Local'}")
+        # Visible even with the settings panel closed -- local is the
+        # actual fallback the whole time Modal isn't "ready"/"alive" (see
+        # backend/main.py: engine_name only ever becomes "modal" once
+        # deploy_and_warm_up() succeeds), so this always reflects which
+        # engine is *actually* running, not just what was requested.
+        host_text = {
+            "deploying": "Cloud (starting…)",
+            "warming up": "Cloud (warming up…)",
+            "stopping": "Cloud (stopping…)",
+            "ready": "Cloud (Modal)",
+            "alive": "Cloud (Modal)",
+        }.get(self.modal_status, "Local")
+        self.advanced_host_label.setText(f"Host: {host_text}")
         self.advanced_model_label.setText(f"Model: {self.settings.engine}")
         tier = self._current_tier or self.settings.tier
         self.advanced_size_label.setText(f"Size: {tier}")
 
-    def _format_entry_html(self, event: dict) -> str:
-        raw_text = event.get("text", "")
-        raw_translated = event.get("translated_text", "")
+    def _wrap_text_box(self, inner_html: str) -> str:
+        """The box behind/around each caption line -- a YouTube-caption-
+        style highlight tightly wrapping the text itself, not the big
+        floating panel (that's #captionPanel in _apply_style, styled
+        independently). background_color/opacity is the highlight fill;
+        border_color/thickness is the outline around the text.
+
+        A single-cell <table>, not a styled <div>: QTextDocument's rich-text
+        engine (used by QTextEdit) silently drops a `border` CSS property
+        set on a <div>/<p> -- confirmed by round-tripping through
+        toHtml() and pixel-sampling a rendered grab(), which is also why
+        border_color previously did nothing. Table borders are a real,
+        reliably-rendered Qt rich-text feature, so the border (and the
+        alpha-blended rgba background, also verified) go on a table
+        instead -- same visual result, actually renders."""
+        s = self.settings
+        bg = QColor(s.background_color)
+        alpha = s.background_opacity / 100
+        bg_rgba = f"rgba({bg.red()},{bg.green()},{bg.blue()},{alpha:.3f})"
+        return (
+            f'<table cellspacing="0" cellpadding="4" border="{s.border_thickness}" '
+            f'style="background-color:{bg_rgba}; border-color:{s.border_color}; border-style:solid;">'
+            f'<tr><td>{inner_html}</td></tr></table>'
+        )
+
+    def _format_entry_html(self, entry: dict) -> str:
+        s = self.settings
+
+        if entry.get("marker") == "delayed":
+            return self._wrap_text_box(f'<span style="color:{s.font_color}; font-style: italic;">&lt;delayed&gt;</span>')
+
+        raw_text = entry.get("text", "")
+        raw_translated = entry.get("translated_text", "")
         text = html.escape(raw_text)
         translated = html.escape(raw_translated)
-        detected = event.get("detected_lang")
-        dest_code = self.dest_combo.currentData()
-        s = self.settings
+        detected = entry.get("detected_lang")
+        dest_code = entry.get("dest_code")
 
         # Same language either by the engine's own report, or because the
         # translation came back byte-identical (e.g. Parakeet never reports
         # detected_lang, so this is the only signal available there).
         same_lang = (bool(detected) and detected == dest_code) or raw_translated == raw_text
         if same_lang or not raw_translated:
-            return f'<div style="color:{s.font_color};">{text}</div>'
+            return self._wrap_text_box(f'<span style="color:{s.font_color};">{text}</span>')
 
         font_color = QColor(s.font_color)
         dim_rgba = f"rgba({font_color.red()}, {font_color.green()}, {font_color.blue()}, 150)"
         secondary_size = max(s.font_size - 2, 8)
-        return (
+        return self._wrap_text_box(
             f'<div style="color:{s.font_color};">{translated}</div>'
             f'<div style="color:{dim_rgba}; font-size:{secondary_size}px;">{text}</div>'
         )
 
     def _record_caption_event(self, kind: str, event: dict) -> None:
-        entry_html = self._format_entry_html(event)
+        entry = {
+            "text": event.get("text", ""),
+            "translated_text": event.get("translated_text", ""),
+            "detected_lang": event.get("detected_lang"),
+            # Snapshotted now, not re-read live at render time: an older
+            # entry must keep judging "same language?" against the
+            # destination that was actually active when it was recorded,
+            # even after the user later changes the destination picker.
+            "dest_code": self.dest_combo.currentData(),
+        }
         if kind == "final":
             if self.settings.persist_subtitles:
-                self._caption_entries.append(entry_html)
+                self._caption_entries.append(entry)
             else:
-                self._caption_entries = [entry_html]
-            self._current_partial_html = ""
+                self._caption_entries = [entry]
+            self._current_partial_entry = None
         else:  # partial
-            self._current_partial_html = entry_html
+            self._current_partial_entry = entry
             if not self.settings.persist_subtitles:
                 self._caption_entries = []
         self._render_caption_view()
 
     def _render_caption_view(self) -> None:
-        blocks = list(self._caption_entries)
-        if self._current_partial_html:
-            blocks.append(self._current_partial_html)
+        blocks = [self._format_entry_html(e) for e in self._caption_entries]
+        if self._current_partial_entry is not None:
+            blocks.append(self._format_entry_html(self._current_partial_entry))
 
         scrollbar = self.caption_view.verticalScrollBar()
         # Only follow new text if the user was already at the bottom --
@@ -531,16 +591,23 @@ class OverlayWindow(QWidget):
         self.caption_view.setHtml("<br>".join(blocks))
 
         if was_at_bottom:
-            # Not scrollbar.setValue(scrollbar.maximum()): QTextEdit's
-            # document layout can still be settling right after setHtml(),
-            # so maximum() read immediately afterward is sometimes stale
-            # (one render behind), and the view would stop short of the
-            # true bottom. Moving the cursor to the document's end is the
-            # idiomatic Qt way to scroll a QTextEdit to "follow" new text
-            # and isn't subject to that staleness.
-            self.caption_view.moveCursor(QTextCursor.MoveOperation.End)
+            # Neither scrollbar.setValue(scrollbar.maximum()) nor
+            # moveCursor(End) right here are reliable: QTextEdit's document
+            # layout is still settling synchronously after setHtml()
+            # returns, so maximum() can read stale (one render behind), and
+            # moveCursor's "scroll the new position into view" side effect
+            # depends on cursor-visibility bookkeeping that a read-only,
+            # never-focused QTextEdit doesn't reliably trigger. Deferring to
+            # the next event-loop turn (after layout has actually finished)
+            # and then setting the scrollbar value directly is what
+            # actually, reliably lands at the true bottom.
+            QTimer.singleShot(0, self._scroll_caption_to_bottom)
         else:
             scrollbar.setValue(previous_value)
+
+    def _scroll_caption_to_bottom(self) -> None:
+        scrollbar = self.caption_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _reposition_caption_icons(self) -> None:
         margin = 6
@@ -558,7 +625,7 @@ class OverlayWindow(QWidget):
 
     def _handle_clear_transcript(self) -> None:
         self._caption_entries = []
-        self._current_partial_html = ""
+        self._current_partial_entry = None
         self._render_caption_view()
 
     def _handle_pause_toggle(self, checked: bool) -> None:
@@ -700,79 +767,79 @@ class OverlayWindow(QWidget):
 
     def _apply_style(self) -> None:
         s = self.settings
-        alpha = int(s.background_opacity / 100 * 255)
-        bg = QColor(s.background_color)
-        bg_rgba = f"rgba({bg.red()}, {bg.green()}, {bg.blue()}, {alpha})"
-        border_css = f"border: {s.border_thickness}px solid {s.border_color};" if s.border_thickness > 0 else "border: none;"
-
-        self.setStyleSheet(f"""
-            #toolbar {{
-                background-color: rgba(30, 30, 30, {min(alpha + 40, 255)});
+        # Fixed, not derived from background_color/background_opacity/
+        # border_*: those settings now style the caption *text* itself
+        # (see _text_box_css), YouTube-caption-style, not this floating
+        # chrome -- the panel/toolbar/footer keep their own constant,
+        # user-independent translucency so they still read as a floating
+        # window regardless of what the user picks for text styling.
+        self.setStyleSheet("""
+            #toolbar {
+                background-color: rgba(30, 30, 30, 210);
                 border-radius: 14px;
-            }}
-            #captionPanel {{
-                background-color: {bg_rgba};
+            }
+            #captionPanel {
+                background-color: rgba(20, 20, 20, 130);
                 border-radius: 14px;
-                {border_css}
-            }}
-            #languageSelector {{
+            }
+            #languageSelector {
                 background-color: rgba(255, 255, 255, 20);
                 border-radius: 12px;
-            }}
-            #advancedPane {{
-                background-color: rgba(0, 0, 0, {min(alpha + 20, 255)});
+            }
+            #advancedPane {
+                background-color: rgba(0, 0, 0, 170);
                 border-radius: 10px;
-            }}
-            #advancedLabel {{
+            }
+            #advancedLabel {
                 color: #cccccc;
                 font-size: 11px;
-            }}
-            #iconButton {{
+            }
+            #iconButton {
                 background: transparent;
                 color: #eeeeee;
                 border: none;
                 font-size: 14px;
                 padding: 2px 6px;
-            }}
-            #iconButton:hover {{
+            }
+            #iconButton:hover {
                 background-color: rgba(255, 255, 255, 30);
                 border-radius: 4px;
-            }}
-            #closeButton {{
+            }
+            #closeButton {
                 background: transparent;
                 color: #eeeeee;
                 border: none;
                 font-size: 15px;
                 font-weight: bold;
                 padding: 2px 6px;
-            }}
-            #closeButton:hover {{
+            }
+            #closeButton:hover {
                 background-color: rgba(255, 255, 255, 30);
                 border-radius: 4px;
-            }}
-            #langCombo {{
+            }
+            #langCombo {
                 color: #eeeeee;
                 background-color: rgba(255, 255, 255, 12);
                 border: 1px solid rgba(255, 255, 255, 70);
                 border-radius: 4px;
                 padding: 1px 4px;
                 font-size: 11px;
-            }}
-            #swapButton {{
+            }
+            #swapButton {
                 background: transparent;
                 color: #eeeeee;
                 border: 1px solid rgba(255, 255, 255, 70);
                 border-radius: 4px;
                 font-size: 14px;
                 padding: 2px 6px;
-            }}
-            #swapButton:hover {{
+            }
+            #swapButton:hover {
                 background-color: rgba(255, 255, 255, 30);
-            }}
-            #captionView {{
+            }
+            #captionView {
                 background: transparent;
                 border: none;
-            }}
+            }
         """)
         self.caption_view.setFont(QFont(s.font_family, s.font_size))
         self.caption_view.viewport().setStyleSheet("background: transparent;")

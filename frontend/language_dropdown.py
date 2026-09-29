@@ -77,11 +77,16 @@ class LanguageDropdown(QPushButton):
         if index == 0 and self._items:
             self._items[0] = (self._items[0][0], text)
         if self._current_code == (self._items[0][0] if self._items else None):
-            self.setText(text)
+            self._set_display_text(text)
 
     def _refresh_text(self) -> None:
         label = next((name for c, name in self._items if c == self._current_code), self._current_code or "")
-        self.setText(label)
+        self._set_display_text(label)
+
+    def _set_display_text(self, label: str) -> None:
+        # A plain QPushButton has no native combo-box arrow -- append one
+        # so it still reads as a dropdown rather than a plain button.
+        self.setText(f"{label} ▾")
 
     def _toggle_popup(self) -> None:
         if self._popup is not None:
