@@ -59,6 +59,15 @@ class WsClient:
     def set_acceptable_latency(self, seconds: float) -> None:
         self._control_queue.put({"type": "set_acceptable_latency", "seconds": seconds})
 
+    def set_paused(self, paused: bool) -> None:
+        # Tells the backend, not just this client, that no more audio is
+        # coming for now -- without this, pausing mid-speech leaves the
+        # backend's segmenter waiting forever for a next audio frame to
+        # notice speech has ended (see backend/main.py's set_paused
+        # handling), stalling the queue/status light with nothing left to
+        # ever unstick them.
+        self._control_queue.put({"type": "set_paused", "paused": paused})
+
     def start_modal_setup(self, token_id: str = "", token_secret: str = "") -> None:
         self._control_queue.put({"type": "start_modal_setup", "token_id": token_id, "token_secret": token_secret})
 

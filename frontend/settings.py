@@ -36,7 +36,7 @@ class Settings:
     # shape of the glyphs (see caption_view.py), like a font's own outline,
     # not a border drawn around a bounding box.
     outline_color: str = "#444444"
-    outline_width: int = 0  # px; 0 = no outline
+    outline_width: float = 0.0  # px; 0 = no outline; fractional widths allowed (e.g. 0.1)
     # A highlight rectangle sized to each caption line, independent of
     # both the outline above and background_color/opacity below (the app
     # window's own panel translucency) -- e.g. YouTube's per-line caption

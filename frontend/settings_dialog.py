@@ -33,7 +33,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QRadioButton,
-    QSlider,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -41,6 +40,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .settings import Settings
+from .stepping_slider import SteppingSlider
 from .toggle_switch import ToggleSwitch
 
 TIER_OPTIONS = [("auto", "Auto"), ("small", "Small"), ("base", "Base"), ("tiny", "Tiny")]
@@ -193,15 +193,17 @@ class SettingsDialog(QWidget):
         layout.addLayout(color_row)
 
         text_form = QFormLayout()
-        self.font_bg_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.font_bg_opacity_slider = SteppingSlider(Qt.Orientation.Horizontal)
         self.font_bg_opacity_slider.setRange(0, 100)
         self.font_bg_opacity_slider.setValue(s.font_background_opacity)
         self.font_bg_opacity_slider.setToolTip("Opacity of the font background highlight (0 = no box).")
         self.font_bg_opacity_slider.valueChanged.connect(lambda v: self._update("font_background_opacity", v))
         text_form.addRow("Font background opacity", self.font_bg_opacity_slider)
 
-        self.outline_width_spin = QSpinBox()
+        self.outline_width_spin = QDoubleSpinBox()
         self.outline_width_spin.setRange(0, 10)
+        self.outline_width_spin.setSingleStep(0.1)
+        self.outline_width_spin.setDecimals(1)
         self.outline_width_spin.setSuffix(" px")
         self.outline_width_spin.setValue(s.outline_width)
         self.outline_width_spin.setToolTip("Outline width around the caption text's letters, in pixels (0 = no outline).")
@@ -221,7 +223,7 @@ class SettingsDialog(QWidget):
         layout.addLayout(window_row)
 
         display_form = QFormLayout()
-        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider = SteppingSlider(Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(0, 100)
         self.opacity_slider.setValue(s.background_opacity)
         self.opacity_slider.setToolTip("Opacity of the overlay panel's background.")
