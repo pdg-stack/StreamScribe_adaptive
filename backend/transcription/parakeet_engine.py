@@ -69,15 +69,23 @@ class ParakeetEngine:
 
     def __init__(self) -> None:
         self._rtf_samples: list[float] = []
+        # transcribe_segment() runs inside asyncio.to_thread; with
+        # PARALLEL_WORKERS > 1 (see backend/main.py), several calls can be
+        # in flight on different OS threads at once, all mutating
+        # _rtf_samples -- the recognizer itself handles concurrent decode
+        # fine (each call gets its own stream), but this bookkeeping needs
+        # its own lock the same way AdaptiveEngine's does.
+        self._state_lock = threading.Lock()
 
     @property
     def model_tier(self) -> str:
         return "parakeet"
 
     def _record_rtf(self, rtf: float) -> str:
-        self._rtf_samples.append(rtf)
-        self._rtf_samples = self._rtf_samples[-STRAIN_WINDOW:]
-        avg_rtf = sum(self._rtf_samples) / len(self._rtf_samples)
+        with self._state_lock:
+            self._rtf_samples.append(rtf)
+            self._rtf_samples = self._rtf_samples[-STRAIN_WINDOW:]
+            avg_rtf = sum(self._rtf_samples) / len(self._rtf_samples)
         if avg_rtf > RTF_YELLOW_MAX:
             return "red"
         if avg_rtf > RTF_GREEN_MAX:

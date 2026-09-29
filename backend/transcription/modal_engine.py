@@ -22,6 +22,7 @@ second concurrent container). Simplified for this app's shape:
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Callable
 
@@ -81,6 +82,14 @@ class ModalEngine:
         self._run_ctx = None
         self._instance = None
         self._rtf_samples: list[float] = []
+        # See AdaptiveEngine._state_lock: transcribe_segment() runs inside
+        # asyncio.to_thread, and backend/main.py's PARALLEL_WORKERS can put
+        # several calls in flight on different OS threads at once, all
+        # mutating _rtf_samples. (The remote calls themselves don't
+        # actually run concurrently on Modal -- max_containers=1 means
+        # Modal queues them server-side -- so this doesn't buy Modal any
+        # real parallelism, just keeps the local bookkeeping race-free.)
+        self._state_lock = threading.Lock()
 
     @property
     def is_active(self) -> bool:
@@ -141,9 +150,10 @@ class ModalEngine:
         elapsed = time.monotonic() - start
 
         rtf = elapsed / duration if duration > 0 else 0.0
-        self._rtf_samples.append(rtf)
-        self._rtf_samples = self._rtf_samples[-4:]
-        avg_rtf = sum(self._rtf_samples) / len(self._rtf_samples)
+        with self._state_lock:
+            self._rtf_samples.append(rtf)
+            self._rtf_samples = self._rtf_samples[-4:]
+            avg_rtf = sum(self._rtf_samples) / len(self._rtf_samples)
         cpu_status = "red" if avg_rtf > 1.0 else "yellow" if avg_rtf > 0.6 else "green"
 
         return TranscriptionResult(
