@@ -23,12 +23,15 @@ Control messages in (JSON text frames):
         entered via start_modal_setup below, not set_engine directly)
     {"type": "set_tier", "tier": "auto"|"small"|"base"|"tiny"}  (faster-whisper only)
     {"type": "set_acceptable_latency", "seconds": float}
-    {"type": "start_modal_setup"}
+    {"type": "start_modal_setup", "token_id": str, "token_secret": str}  (both
+        optional -- see modal_engine.py's deploy_and_warm_up; blank/omitted
+        falls back to whatever ambient Modal auth the container has)
     {"type": "stop_modal"}
 
 Modal status events out (see transcription/modal_engine.py):
     {"type": "modal_setup_status",
-     "status": "deploying"|"warming up"|"ready"|"alive"|"terminated",
+     "status": "deploying"|"warming up"|"ready"|"alive"|"stopping"|"terminated",
+     "error": str,  # only present on a "terminated" that followed a setup failure
      "timestamp": float}
 """
 
@@ -103,13 +106,16 @@ class ConnectionState:
         self.engine_name = DEFAULT_ENGINE
 
 
-async def _send_modal_status(websocket: WebSocket, send_lock: asyncio.Lock, status: str) -> None:
+async def _send_modal_status(websocket: WebSocket, send_lock: asyncio.Lock, status: str, error: str | None = None) -> None:
+    message = {
+        "type": "modal_setup_status",
+        "status": status,
+        "timestamp": time.time(),
+    }
+    if error:
+        message["error"] = error
     async with send_lock:
-        await websocket.send_text(json.dumps({
-            "type": "modal_setup_status",
-            "status": status,
-            "timestamp": time.time(),
-        }))
+        await websocket.send_text(json.dumps(message))
 
 
 async def _modal_heartbeat(websocket: WebSocket, engines: dict, state: ConnectionState, send_lock: asyncio.Lock) -> None:
@@ -124,18 +130,26 @@ async def _modal_heartbeat(websocket: WebSocket, engines: dict, state: Connectio
             await _send_modal_status(websocket, send_lock, "alive")
 
 
-async def _handle_modal_setup(websocket: WebSocket, engines: dict, state: ConnectionState, send_lock: asyncio.Lock) -> None:
+async def _handle_modal_setup(
+    websocket: WebSocket, engines: dict, state: ConnectionState, send_lock: asyncio.Lock,
+    token_id: str | None = None, token_secret: str | None = None,
+) -> None:
     loop = asyncio.get_running_loop()
 
     def on_status(status: str) -> None:
         asyncio.run_coroutine_threadsafe(_send_modal_status(websocket, send_lock, status), loop)
 
     try:
-        await asyncio.to_thread(engines["modal"].deploy_and_warm_up, on_status)
+        await asyncio.to_thread(engines["modal"].deploy_and_warm_up, on_status, token_id, token_secret)
         state.engine_name = "modal"
         asyncio.create_task(_modal_heartbeat(websocket, engines, state, send_lock))
-    except Exception:
-        await _send_modal_status(websocket, send_lock, "terminated")
+    except Exception as exc:
+        # Printed here (Docker logs) *and* sent to the frontend -- silently
+        # reverting to "terminated" with no detail was the actual bug
+        # report ("modal instance setup is failing"): the failure was real
+        # but invisible, on both ends.
+        print(f"[Modal] setup failed: {exc}", flush=True)
+        await _send_modal_status(websocket, send_lock, "terminated", error=str(exc))
 
 
 async def _handle_modal_stop(websocket: WebSocket, engines: dict, state: ConnectionState, send_lock: asyncio.Lock) -> None:
@@ -203,7 +217,9 @@ async def _receiver(websocket: WebSocket, segmenter: VadSegmenter, queue: Segmen
                 if requested in ("faster-whisper", "parakeet"):
                     state.engine_name = requested
             elif control_type == "start_modal_setup":
-                asyncio.create_task(_handle_modal_setup(websocket, engines, state, send_lock))
+                token_id = control.get("token_id") or None
+                token_secret = control.get("token_secret") or None
+                asyncio.create_task(_handle_modal_setup(websocket, engines, state, send_lock, token_id, token_secret))
             elif control_type == "stop_modal":
                 asyncio.create_task(_handle_modal_stop(websocket, engines, state, send_lock))
 
