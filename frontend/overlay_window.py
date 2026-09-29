@@ -334,11 +334,14 @@ class OverlayWindow(QWidget):
         kind = event.get("type")
         if kind == "modal_setup_status":
             new_status = event.get("status", "terminated")
+            error = event.get("error")
             if new_status != self.modal_status:
                 print(f"[Modal] status: {self.modal_status} -> {new_status}", flush=True)
+            if error:
+                print(f"[Modal] setup failed: {error}", flush=True)
             self.modal_status = new_status
             if self._settings_panel is not None:
-                self._settings_panel.set_modal_status(self.modal_status)
+                self._settings_panel.set_modal_status(self.modal_status, error)
             self._update_advanced_pane()
             return
 
@@ -500,28 +503,31 @@ class OverlayWindow(QWidget):
         tier = self._current_tier or self.settings.tier
         self.advanced_size_label.setText(f"Size: {tier}")
 
-    def _wrap_text_box(self, inner_html: str) -> str:
-        """The box behind/around each caption line -- a YouTube-caption-
-        style highlight tightly wrapping the text itself, not the big
-        floating panel (that's #captionPanel in _apply_style, styled
-        independently). background_color/opacity is the highlight fill;
-        border_color/thickness is the outline around the text.
+    def _wrap_text_border(self, inner_html: str) -> str:
+        """A border around the caption text itself -- border_color/
+        thickness -- distinct from background_color/opacity, which is the
+        floating panel's own background (#captionPanel in _apply_style).
+        Kept as a thin frame hugging the text (no fill), not a highlight
+        box: its purpose is contrast between the text and whatever's
+        behind it (the panel, or anything showing through a transparent
+        one), which matters most exactly when font/background colors are
+        close together.
 
-        A single-cell <table>, not a styled <div>: QTextDocument's rich-text
-        engine (used by QTextEdit) silently drops a `border` CSS property
-        set on a <div>/<p> -- confirmed by round-tripping through
-        toHtml() and pixel-sampling a rendered grab(), which is also why
-        border_color previously did nothing. Table borders are a real,
-        reliably-rendered Qt rich-text feature, so the border (and the
-        alpha-blended rgba background, also verified) go on a table
-        instead -- same visual result, actually renders."""
+        A single-cell <table>, not a styled <div>: QTextDocument's rich-
+        text engine (used by QTextEdit) silently drops a `border` CSS
+        property set on a <div>/<p> -- confirmed by round-tripping through
+        toHtml() and pixel-sampling a rendered grab() -- and drops
+        `text-shadow` too (checked specifically since a multi-directional
+        shadow is the usual way to fake a true per-glyph stroke when real
+        text-stroke isn't supported). Table borders are the one reliably-
+        rendered option Qt's rich text actually has, so this is a tight
+        frame around the text block rather than a stroke following each
+        glyph's outline -- a real limitation of this rendering path, not
+        a design choice."""
         s = self.settings
-        bg = QColor(s.background_color)
-        alpha = s.background_opacity / 100
-        bg_rgba = f"rgba({bg.red()},{bg.green()},{bg.blue()},{alpha:.3f})"
         return (
-            f'<table cellspacing="0" cellpadding="4" border="{s.border_thickness}" '
-            f'style="background-color:{bg_rgba}; border-color:{s.border_color}; border-style:solid;">'
+            f'<table cellspacing="0" cellpadding="1" border="{s.border_thickness}" '
+            f'style="border-color:{s.border_color}; border-style:solid;">'
             f'<tr><td>{inner_html}</td></tr></table>'
         )
 
@@ -529,7 +535,7 @@ class OverlayWindow(QWidget):
         s = self.settings
 
         if entry.get("marker") == "delayed":
-            return self._wrap_text_box(f'<span style="color:{s.font_color}; font-style: italic;">&lt;delayed&gt;</span>')
+            return self._wrap_text_border(f'<span style="color:{s.font_color}; font-style: italic;">&lt;delayed&gt;</span>')
 
         raw_text = entry.get("text", "")
         raw_translated = entry.get("translated_text", "")
@@ -543,12 +549,12 @@ class OverlayWindow(QWidget):
         # detected_lang, so this is the only signal available there).
         same_lang = (bool(detected) and detected == dest_code) or raw_translated == raw_text
         if same_lang or not raw_translated:
-            return self._wrap_text_box(f'<span style="color:{s.font_color};">{text}</span>')
+            return self._wrap_text_border(f'<span style="color:{s.font_color};">{text}</span>')
 
         font_color = QColor(s.font_color)
         dim_rgba = f"rgba({font_color.red()}, {font_color.green()}, {font_color.blue()}, 150)"
         secondary_size = max(s.font_size - 2, 8)
-        return self._wrap_text_box(
+        return self._wrap_text_border(
             f'<div style="color:{s.font_color};">{translated}</div>'
             f'<div style="color:{dim_rgba}; font-size:{secondary_size}px;">{text}</div>'
         )
@@ -767,79 +773,83 @@ class OverlayWindow(QWidget):
 
     def _apply_style(self) -> None:
         s = self.settings
-        # Fixed, not derived from background_color/background_opacity/
-        # border_*: those settings now style the caption *text* itself
-        # (see _text_box_css), YouTube-caption-style, not this floating
-        # chrome -- the panel/toolbar/footer keep their own constant,
-        # user-independent translucency so they still read as a floating
-        # window regardless of what the user picks for text styling.
-        self.setStyleSheet("""
-            #toolbar {
-                background-color: rgba(30, 30, 30, 210);
+        # background_color/background_opacity is the app window's own
+        # translucency -- the floating toolbar/caption panel/footer chrome
+        # -- not the caption text (that's border_color/thickness, on the
+        # text itself; see _wrap_text_border). Restored to that after a
+        # round where it was temporarily repurposed as a text highlight;
+        # this is the original, correct scope.
+        alpha = int(s.background_opacity / 100 * 255)
+        bg = QColor(s.background_color)
+        bg_rgba = f"rgba({bg.red()}, {bg.green()}, {bg.blue()}, {alpha})"
+
+        self.setStyleSheet(f"""
+            #toolbar {{
+                background-color: rgba(30, 30, 30, {min(alpha + 40, 255)});
                 border-radius: 14px;
-            }
-            #captionPanel {
-                background-color: rgba(20, 20, 20, 130);
+            }}
+            #captionPanel {{
+                background-color: {bg_rgba};
                 border-radius: 14px;
-            }
-            #languageSelector {
+            }}
+            #languageSelector {{
                 background-color: rgba(255, 255, 255, 20);
                 border-radius: 12px;
-            }
-            #advancedPane {
-                background-color: rgba(0, 0, 0, 170);
+            }}
+            #advancedPane {{
+                background-color: rgba(0, 0, 0, {min(alpha + 20, 255)});
                 border-radius: 10px;
-            }
-            #advancedLabel {
+            }}
+            #advancedLabel {{
                 color: #cccccc;
                 font-size: 11px;
-            }
-            #iconButton {
+            }}
+            #iconButton {{
                 background: transparent;
                 color: #eeeeee;
                 border: none;
                 font-size: 14px;
                 padding: 2px 6px;
-            }
-            #iconButton:hover {
+            }}
+            #iconButton:hover {{
                 background-color: rgba(255, 255, 255, 30);
                 border-radius: 4px;
-            }
-            #closeButton {
+            }}
+            #closeButton {{
                 background: transparent;
                 color: #eeeeee;
                 border: none;
                 font-size: 15px;
                 font-weight: bold;
                 padding: 2px 6px;
-            }
-            #closeButton:hover {
+            }}
+            #closeButton:hover {{
                 background-color: rgba(255, 255, 255, 30);
                 border-radius: 4px;
-            }
-            #langCombo {
+            }}
+            #langCombo {{
                 color: #eeeeee;
                 background-color: rgba(255, 255, 255, 12);
                 border: 1px solid rgba(255, 255, 255, 70);
                 border-radius: 4px;
                 padding: 1px 4px;
                 font-size: 11px;
-            }
-            #swapButton {
+            }}
+            #swapButton {{
                 background: transparent;
                 color: #eeeeee;
                 border: 1px solid rgba(255, 255, 255, 70);
                 border-radius: 4px;
                 font-size: 14px;
                 padding: 2px 6px;
-            }
-            #swapButton:hover {
+            }}
+            #swapButton:hover {{
                 background-color: rgba(255, 255, 255, 30);
-            }
-            #captionView {
+            }}
+            #captionView {{
                 background: transparent;
                 border: none;
-            }
+            }}
         """)
         self.caption_view.setFont(QFont(s.font_family, s.font_size))
         self.caption_view.viewport().setStyleSheet("background: transparent;")
