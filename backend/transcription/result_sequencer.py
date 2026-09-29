@@ -74,6 +74,28 @@ class ResultSequencer:
             self._pending[seq] = message
             await self._flush(websocket, send_lock, acceptable_latency)
 
+    async def submit_idle(self, seq: int, message: dict, websocket: WebSocket, send_lock: asyncio.Lock) -> None:
+        """Routes the "idle" transition (speech -> silence) through this
+        same ordering mechanism, at the seq the queue's *next* push would
+        get (i.e. "after everything pushed so far"). Sent directly instead
+        (bypassing the sequencer entirely) was the original design, and it
+        could race ahead of a still-in-flight segment's result: idle
+        arrives and turns the status light off, then a slower segment's
+        result -- say, cpu_status="red" from before audio stopped --
+        arrives *after* it and turns the light back on, with nothing left
+        to ever turn it off again since no more audio is coming. Unlike
+        submit_result, a seq at-or-behind next_seq here means everything
+        ahead of it is already resolved, so it sends immediately instead
+        of being treated as a stale straggler to discard."""
+        async with self._lock:
+            if seq <= self._next_seq:
+                message["timestamp"] = time.time()
+                async with send_lock:
+                    await websocket.send_text(json.dumps(message))
+                return
+            self._pending[seq] = message
+            await self._flush(websocket, send_lock)
+
     async def tick(self, acceptable_latency: float, websocket: WebSocket, send_lock: asyncio.Lock) -> None:
         """Periodic nudge (see main.py's _sequencer_ticker) so a segment
         that's been in flight too long gets skipped promptly even if no
