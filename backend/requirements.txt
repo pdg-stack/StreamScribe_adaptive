@@ -6,6 +6,8 @@ ctranslate2>=4.0
 sentencepiece>=0.2
 huggingface_hub>=0.24
 numpy>=1.26
+sherpa-onnx>=1.10
+modal>=0.65
 
 # Only needed for the one-time NLLB-200 HF->CTranslate2 conversion on first
 # run (torch itself is installed separately in the Dockerfile, CPU-only

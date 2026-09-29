@@ -7,6 +7,7 @@ segments so the overlay never looks frozen mid-sentence.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -30,6 +31,9 @@ _PARTIAL_WINDOW_FRAMES = int(PARTIAL_INTERVAL_S * 2 * 1000 / FRAME_MS)
 class SegmenterEvent:
     kind: str  # "partial" | "final"
     audio: np.ndarray  # mono float32 PCM in [-1, 1]
+    closed_at: float  # time.time() when this event was produced -- used by
+    # the frontend's acceptable-latency logic and the backend's queue
+    # preemption to measure how stale a pending segment has become.
 
 
 @dataclass
@@ -79,7 +83,7 @@ class VadSegmenter:
             return []
 
         if self._silence_ms >= SILENCE_TRIGGER_MS or self._segment_ms >= MAX_SEGMENT_S * 1000:
-            event = SegmenterEvent(kind="final", audio=self._to_audio(self._segment_frames))
+            event = SegmenterEvent(kind="final", audio=self._to_audio(self._segment_frames), closed_at=time.time())
             self._reset()
             return [event]
 
@@ -89,7 +93,7 @@ class VadSegmenter:
             # segment length -- only the most recent ~2x the partial
             # interval is re-transcribed each time, not the whole segment.
             window = self._segment_frames[-_PARTIAL_WINDOW_FRAMES:]
-            return [SegmenterEvent(kind="partial", audio=self._to_audio(window))]
+            return [SegmenterEvent(kind="partial", audio=self._to_audio(window), closed_at=time.time())]
 
         return []
 

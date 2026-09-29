@@ -90,12 +90,19 @@ def _load() -> tuple[ctranslate2.Translator, spm.SentencePieceProcessor]:
 def translate(text: str, src: str, dst: str = "en") -> str:
     """src/dst are ISO 639-1 codes (matching Whisper's detected_lang and
     the frontend's destination picker)."""
-    if not text.strip() or src == dst:
+    if not text.strip():
+        return text
+
+    # Compare resolved NLLB codes, not raw ISO ones: Parakeet never reports
+    # detected_lang (src=None), so a raw "src == dst" check can't catch
+    # "source happens to already be the destination language" the way it
+    # does for faster-whisper -- but nllb_code(None) still resolves to the
+    # same eng_Latn fallback as an actual "en", so this comparison does.
+    src_lang, dst_lang = nllb_code(src), nllb_code(dst)
+    if src_lang == dst_lang:
         return text
 
     translator, tokenizer = _load()
-    src_lang, dst_lang = nllb_code(src), nllb_code(dst)
-
     source_tokens = [src_lang] + tokenizer.encode(text, out_type=str) + ["</s>"]
     results = translator.translate_batch([source_tokens], target_prefix=[[dst_lang]])
     output_tokens = results[0].hypotheses[0][1:]  # drop the target_prefix token

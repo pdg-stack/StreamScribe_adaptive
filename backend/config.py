@@ -2,6 +2,8 @@
 defaults (per the implementation plan) meant to be tuned empirically
 against real audio during Sprint 1 testing, not treated as final."""
 
+import os
+
 BEAM_SIZE = 5
 
 # ASR fallback cascade, most-accurate first. "tiny" is the floor -- no
@@ -27,3 +29,54 @@ STRAIN_WINDOW = 4  # consecutive segments averaged before switching tiers
 NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"
 NLLB_MODEL_DIR = "/root/.cache/streamscribe/nllb-200-distilled-600M-ct2"
 DEFAULT_DST_LANG = "en"
+DEFAULT_SRC_LANG = "auto"
+DEFAULT_TIER_MODE = "auto"
+DEFAULT_ENGINE = "faster-whisper"
+
+# Parakeet TDT 0.6B v3, via sherpa-onnx's quantized ONNX export -- local
+# only, never via Modal (see plan). Covers Russian/Spanish/English/
+# Italian/Portuguese; the frontend's language dropdown limits selectable
+# languages to what's actually available per engine.
+PARAKEET_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2"
+PARAKEET_CACHE_DIR = "/root/.cache/streamscribe/parakeet"
+
+# Queue preemption: if the predicted wait for the newest queued segment
+# (queue depth ahead of it * recent average processing time) exceeds this
+# multiple of the user's acceptable-latency setting, drop everything queued
+# except the newest segment so processing catches up to "now".
+QUEUE_PREEMPTION_FACTOR = 1.2
+PROCESSING_TIME_WINDOW = 4  # segments averaged for the preemption estimate
+DEFAULT_ACCEPTABLE_LATENCY_S = 1
+
+# Queue-length tier fallback: a second, more urgent strain signal alongside
+# RTF_* above (faster-whisper only -- Parakeet has no tiers to fall back
+# through). A burst of segments can back the queue up even when each one
+# individually still looks fine to RTF, so in "auto" tier_mode try a
+# lighter model tier first -- it's reversible and may well let the queue
+# drain on its own -- before ever resorting to queue preemption (which
+# drops segments outright and can't be undone for those segments). Steps
+# back up the same way once the backlog clears. Uses a shorter window than
+# STRAIN_WINDOW since backlog is a direct, current symptom rather than a
+# lagging average.
+QUEUE_LENGTH_DEMOTE_DEPTH = 2   # avg segments-ahead above this -> step down a tier
+QUEUE_LENGTH_PROMOTE_DEPTH = 0  # avg segments-ahead at/below this -> try stepping back up
+QUEUE_STRAIN_WINDOW = 2
+
+# Adaptive parallelism: process up to this many segments concurrently
+# instead of strictly one at a time, so a burst of speech doesn't have to
+# wait for each prior segment to fully finish -- directly shrinks queue
+# backlog, on top of (not instead of) the tier-fallback and preemption
+# above. Sized from the CPU actually available: each worker gets its own
+# share of threads for its own single inference (faster-whisper's
+# `cpu_threads`), so total demand (workers * threads-per-worker) stays
+# inside what the machine actually has rather than oversubscribing it and
+# making every segment slower -- on a 2-core box this collapses back to
+# one worker using both threads, i.e. today's serialized behavior, since
+# splitting a machine that small into competing workers would only add
+# contention, not throughput. GPU (Modal) is unaffected -- Modal's own
+# container stays single-flight by design (see modal_engine.py's
+# max_containers=1), a separate concern from local CPU parallelism.
+MAX_PARALLEL_WORKERS = 4
+_cpu_count = os.cpu_count() or 2
+PARALLEL_WORKERS = max(1, min(_cpu_count // 2, MAX_PARALLEL_WORKERS))
+CPU_THREADS_PER_WORKER = max(1, _cpu_count // PARALLEL_WORKERS)
