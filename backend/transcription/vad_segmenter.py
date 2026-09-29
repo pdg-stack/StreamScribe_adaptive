@@ -104,6 +104,23 @@ class VadSegmenter:
         self._last_partial_ms = 0
         self._in_speech = False
 
+    def force_close(self) -> list[SegmenterEvent]:
+        """Closes whatever's currently buffered as a final segment, as if
+        trailing silence had just completed naturally, and resets to a
+        clean idle state. For when the frontend pauses capture: no more
+        audio bytes are coming, so the normal "the next frame arrives and
+        detects the speech->silence transition" path (_push_frame, only
+        reachable via push()) can never fire on its own -- without this,
+        in_speech would stay stuck True and this connection would never
+        emit another idle transition, leaving the frontend's queue/status
+        light waiting on something that will never arrive."""
+        if not self._in_speech or not self._segment_frames:
+            self._reset()
+            return []
+        event = SegmenterEvent(kind="final", audio=self._to_audio(self._segment_frames), closed_at=time.time())
+        self._reset()
+        return [event]
+
     @staticmethod
     def _to_audio(frames: list[bytes]) -> np.ndarray:
         pcm = b"".join(frames)
