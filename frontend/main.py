@@ -82,6 +82,7 @@ def main() -> None:
 
     def on_pause_toggled(paused: bool) -> None:
         audio_state.paused = paused
+        ws_client.set_paused(paused)
 
     def on_audio_captured(pcm_bytes: bytes) -> None:
         if not audio_state.paused:

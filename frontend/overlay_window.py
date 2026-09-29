@@ -180,6 +180,19 @@ class OverlayWindow(QWidget):
 
         self._apply_style()
         self._apply_auto_hide()
+        # The very first _reposition_caption_overlays() call (end of
+        # _build_caption_panel) runs before this window's layout has
+        # actually settled -- at that point captionPanel isn't parented
+        # into root yet, so caption_view still has some arbitrary pre-
+        # layout size, not its real one. A later resize (the user
+        # resizing the window) correctly re-triggers it via the
+        # QEvent.Resize eventFilter path, but nothing does for the
+        # *initial* settling, leaving the copy/clear icons and resize
+        # grip stuck at positions computed from that wrong early size
+        # (confirmed: calling this again with the real size immediately
+        # corrects it). Deferring one event-loop turn runs it after
+        # show()'s layout pass has actually finished.
+        QTimer.singleShot(0, self._reposition_caption_overlays)
 
     # -- toolbar -----------------------------------------------------
     def _source_languages_for_engine(self, engine: str) -> list[tuple[str, str]]:
@@ -230,7 +243,12 @@ class OverlayWindow(QWidget):
         for w in (self.source_combo, swap_btn, self.dest_combo):
             lang_layout.addWidget(w)
 
-        self.pause_btn = QPushButton("⏸")  # pause/resume audio capture
+        # "▮▮" (pause, two bars) / "▶" (play/resume), both
+        # from the Geometric Shapes block -- the previous pause glyph
+        # ("⏸", Miscellaneous Technical) is a different Unicode block
+        # that a lot of fonts render with an emoji-style presentation,
+        # visually mismatched against the plain triangle used for play.
+        self.pause_btn = QPushButton("▮▮")  # pause/resume audio capture
         self.pause_btn.setObjectName("iconButton")
         self.pause_btn.setCheckable(True)
         self.pause_btn.setToolTip("Pause audio capture")
@@ -650,7 +668,7 @@ class OverlayWindow(QWidget):
         self._render_caption_view()
 
     def _handle_pause_toggle(self, checked: bool) -> None:
-        self.pause_btn.setText("▶" if checked else "⏸")
+        self.pause_btn.setText("▶" if checked else "▮▮")
         self.pause_btn.setToolTip("Resume audio capture" if checked else "Pause audio capture")
         self._on_pause_toggled(checked)
 

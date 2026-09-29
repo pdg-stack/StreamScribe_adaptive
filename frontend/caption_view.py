@@ -58,7 +58,7 @@ class CaptionView(QAbstractScrollArea):
         self._content_height = 0
         self._font_background: QColor | None = None
         self._outline_color = QColor("#444444")
-        self._outline_width = 0
+        self._outline_width = 0.0
 
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -74,16 +74,19 @@ class CaptionView(QAbstractScrollArea):
             QAbstractScrollArea { background: transparent; border: none; }
             QScrollBar:vertical {
                 width: 16px;
-                background: rgba(255, 255, 255, 10);
+                background: rgba(255, 255, 255, 12);
                 margin: 0px;
             }
             QScrollBar::handle:vertical {
-                background: rgba(255, 255, 255, 90);
+                background: rgba(255, 255, 255, 150);
                 min-height: 24px;
                 border-radius: 6px;
             }
-            QScrollBar::handle:vertical:hover { background: rgba(255, 255, 255, 140); }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::handle:vertical:hover { background: rgba(255, 255, 255, 200); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+                subcontrol-origin: margin;
+            }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
         """)
 
@@ -100,7 +103,7 @@ class CaptionView(QAbstractScrollArea):
         plain_text: str,
         font_background: QColor | None,
         outline_color: QColor,
-        outline_width: int,
+        outline_width: float,
     ) -> None:
         """paragraphs: list of (text, hex_or_rgba_color, font_size, italic).
         Caller (OverlayWindow) is responsible for turning caption entries
