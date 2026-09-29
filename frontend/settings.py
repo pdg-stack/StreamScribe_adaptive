@@ -6,7 +6,7 @@ persisted to a JSON file next to this app so it survives restarts.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 PREFS_PATH = Path(__file__).parent / "user_prefs.json"
@@ -64,6 +64,19 @@ class Settings:
         if PREFS_PATH.exists():
             try:
                 data = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+                # Drop keys that aren't (or no longer are) real fields --
+                # cls(**merged) raises TypeError on an unexpected keyword,
+                # and that exception being caught below previously meant a
+                # renamed/removed field (e.g. a prior border_color ->
+                # outline_color rename) silently discarded the *entire*
+                # saved file back to all-defaults on next load, and the
+                # very next save() (window move, any settings tweak)
+                # permanently overwrote it that way -- which is how a
+                # saved Modal token got wiped without any error at all.
+                # Forward-compatible now: unknown keys are just ignored,
+                # every other saved value survives a field rename.
+                known = {f.name for f in fields(cls)}
+                data = {k: v for k, v in data.items() if k in known}
                 return cls(**{**asdict(cls()), **data})
             except (json.JSONDecodeError, TypeError):
                 pass
