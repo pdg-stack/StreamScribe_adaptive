@@ -11,7 +11,6 @@ in the advanced pane (see plan's Advanced mode), hidden by default.
 
 from __future__ import annotations
 
-import html
 import time
 
 from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer
@@ -25,12 +24,12 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QSizeGrip,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from .caption_icons import LineIconButton
+from .caption_view import CaptionView
 from .language_dropdown import LanguageDropdown
 from .settings import Settings
 from .settings_dialog import SettingsDialog
@@ -127,11 +126,11 @@ class OverlayWindow(QWidget):
         self._last_worker_count: int | None = None  # unknown until the backend's first event
         self._last_known_engine = settings.engine
         self._last_partial_update = 0.0
-        # Raw content, not pre-rendered HTML: _format_entry_html() renders
-        # each entry fresh at *render* time (every _render_caption_view()
-        # call), so a live style change (font/background/border color)
-        # repaints existing lines immediately instead of only affecting
-        # whatever caption arrives next.
+        # Raw content, not pre-rendered paragraphs: _entry_paragraphs()
+        # renders each entry fresh at *render* time (every
+        # _render_caption_view() call), so a live style change (font/
+        # background/outline color) repaints existing lines immediately
+        # instead of only affecting whatever caption arrives next.
         self._caption_entries: list[dict] = []  # finalized entries
         self._current_partial_entry: dict | None = None
         self._drag_offset: QPoint | None = None
@@ -262,20 +261,15 @@ class OverlayWindow(QWidget):
         self._caption_panel = panel
         panel.installEventFilter(self)
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        # QTextEdit (not QLabel) so long lines wrap to the panel's width and,
-        # when "persist subtitles" is on, older lines scroll rather than
-        # getting clipped.
-        self.caption_view = QTextEdit()
+        # Custom-painted (see caption_view.py), not QTextEdit/rich-text:
+        # that's what makes a true per-glyph text outline and an
+        # independent font-background rectangle possible at all. Its own
+        # scrollbar (always visible, permanently reserved width) already
+        # spans this widget's full height with nothing extra needed.
+        self.caption_view = CaptionView()
         self.caption_view.setObjectName("captionView")
-        self.caption_view.setReadOnly(True)
-        self.caption_view.setFrameShape(QFrame.Shape.NoFrame)
-        # Always visible (not just when content overflows), with a
-        # permanently reserved vertical strip -- not floating over the
-        # text -- so it's unambiguous whether the view is scrolled and
-        # where, and it never has to jostle for space with the copy/clear
-        # icons the way an overlay scrollbar would.
-        self.caption_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.caption_view.installEventFilter(self)
         layout.addWidget(self.caption_view, stretch=1)
 
@@ -293,12 +287,18 @@ class OverlayWindow(QWidget):
         self.clear_btn.clicked.connect(self._handle_clear_transcript)
         self.clear_btn.setVisible(False)
 
-        grip_row = QHBoxLayout()
-        grip_row.addStretch(1)
-        grip_row.addWidget(QSizeGrip(self))
-        layout.addLayout(grip_row)
+        # Also a plain child of caption_view, not a layout row below it --
+        # "a frame with the text box and resizer, and the scrollbar in the
+        # parent frame spanning the whole vertical height of the text
+        # box": the resizer sits inset in caption_view's own bottom-right
+        # corner, just to the left of its scrollbar, rather than in a
+        # separate row that would otherwise shrink the scrollbar's span.
+        # QSizeGrip resolves which *window* to resize by walking up from
+        # its parent to the nearest top-level, so parenting it to
+        # caption_view (not self) still resizes the overlay correctly.
+        self.size_grip = QSizeGrip(self.caption_view)
 
-        self._reposition_caption_icons()
+        self._reposition_caption_overlays()
         return panel
 
     def _build_advanced_pane(self) -> QFrame:
@@ -309,7 +309,7 @@ class OverlayWindow(QWidget):
         pane.setObjectName("advancedPane")
         grid = QGridLayout(pane)
         grid.setContentsMargins(10, 4, 10, 4)
-        grid.setHorizontalSpacing(18)
+        grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(1)
         # Auto-hide fades opacity rather than calling setVisible(False), so
         # the pane keeps its layout slot and the caption panel above it
@@ -332,6 +332,11 @@ class OverlayWindow(QWidget):
         for col, w in enumerate(row1):
             w.setObjectName("advancedLabel")
             grid.addWidget(w, 1, col)
+
+        # Source (row0 col3) tends to hold the longest text (application
+        # names) -- give it more of the pane's width than the others,
+        # which are short and fixed-ish ("Queue: 3", "Threads: 4").
+        grid.setColumnStretch(3, 2)
 
         self._advanced_pane = pane
         self._update_advanced_pane()
@@ -418,11 +423,15 @@ class OverlayWindow(QWidget):
             self._last_result_at = time.time()  # start a fresh window instead of re-showing every tick
 
     def _show_delayed_marker(self) -> None:
-        marker = {"marker": "delayed"}
+        already_delayed = bool(self._caption_entries) and self._caption_entries[-1].get("marker") == "delayed"
         if self.settings.persist_subtitles:
-            self._caption_entries.append(marker)
+            # Repeated delayed detections describe the same ongoing gap,
+            # not a new one each time -- don't pile up a fresh <delayed>
+            # line for every poll tick while it continues.
+            if not already_delayed:
+                self._caption_entries.append({"marker": "delayed"})
         else:
-            self._caption_entries = [marker]
+            self._caption_entries = [{"marker": "delayed"}]
         self._current_partial_entry = None
         self._render_caption_view()
 
@@ -517,44 +526,17 @@ class OverlayWindow(QWidget):
         tier = self._current_tier or self.settings.tier
         self.advanced_size_label.setText(f"Size: {tier}")
 
-    def _wrap_text_outline(self, inner_html: str) -> str:
-        """The caption text's own outline -- outline_color/outline_width --
-        distinct from background_color/opacity, which is the floating
-        panel's own background (#captionPanel in _apply_style). Kept as a
-        thin frame hugging the text (no fill), not a highlight box: its
-        purpose is contrast between the text and whatever's behind it (the
-        panel, or anything showing through a transparent one), which
-        matters most exactly when font/background colors are close
-        together.
-
-        A single-cell <table>, not a styled <div>: QTextDocument's rich-
-        text engine (used by QTextEdit) silently drops a `border` CSS
-        property set on a <div>/<p> -- confirmed by round-tripping through
-        toHtml() and pixel-sampling a rendered grab() -- and drops
-        `text-shadow` too (checked specifically since a multi-directional
-        shadow is the usual way to fake a true per-glyph stroke when real
-        text-stroke isn't supported). Table borders are the one reliably-
-        rendered option Qt's rich text actually has, so this is a tight
-        frame around the text block rather than a stroke following each
-        glyph's outline -- a real limitation of this rendering path, not
-        a design choice."""
-        s = self.settings
-        return (
-            f'<table cellspacing="0" cellpadding="1" border="{s.outline_width}" '
-            f'style="border-color:{s.outline_color}; border-style:solid;">'
-            f'<tr><td>{inner_html}</td></tr></table>'
-        )
-
-    def _format_entry_html(self, entry: dict) -> str:
+    def _entry_paragraphs(self, entry: dict) -> list[tuple[str, QColor, int, bool]]:
+        """One caption entry -> one or two (text, color, font_size, italic)
+        paragraphs for CaptionView.render() -- two when there's a
+        translated primary line plus a dimmer original secondary line."""
         s = self.settings
 
         if entry.get("marker") == "delayed":
-            return self._wrap_text_outline(f'<span style="color:{s.font_color}; font-style: italic;">&lt;delayed&gt;</span>')
+            return [("<delayed>", QColor(s.font_color), s.font_size, True)]
 
         raw_text = entry.get("text", "")
         raw_translated = entry.get("translated_text", "")
-        text = html.escape(raw_text)
-        translated = html.escape(raw_translated)
         detected = entry.get("detected_lang")
         dest_code = entry.get("dest_code")
 
@@ -563,15 +545,26 @@ class OverlayWindow(QWidget):
         # detected_lang, so this is the only signal available there).
         same_lang = (bool(detected) and detected == dest_code) or raw_translated == raw_text
         if same_lang or not raw_translated:
-            return self._wrap_text_outline(f'<span style="color:{s.font_color};">{text}</span>')
+            return [(raw_text, QColor(s.font_color), s.font_size, False)]
 
-        font_color = QColor(s.font_color)
-        dim_rgba = f"rgba({font_color.red()}, {font_color.green()}, {font_color.blue()}, 150)"
-        secondary_size = max(s.font_size - 2, 8)
-        return self._wrap_text_outline(
-            f'<div style="color:{s.font_color};">{translated}</div>'
-            f'<div style="color:{dim_rgba}; font-size:{secondary_size}px;">{text}</div>'
-        )
+        dim = QColor(s.font_color)
+        dim.setAlpha(150)
+        return [
+            (raw_translated, QColor(s.font_color), s.font_size, False),
+            (raw_text, dim, max(s.font_size - 2, 8), False),
+        ]
+
+    def _entry_plain_text(self, entry: dict) -> str:
+        if entry.get("marker") == "delayed":
+            return "<delayed>"
+        raw_text = entry.get("text", "")
+        raw_translated = entry.get("translated_text", "")
+        detected = entry.get("detected_lang")
+        dest_code = entry.get("dest_code")
+        same_lang = (bool(detected) and detected == dest_code) or raw_translated == raw_text
+        if same_lang or not raw_translated:
+            return raw_text
+        return f"{raw_translated}\n{raw_text}"
 
     def _record_caption_event(self, kind: str, event: dict) -> None:
         entry = {
@@ -596,40 +589,40 @@ class OverlayWindow(QWidget):
                 self._caption_entries = []
         self._render_caption_view()
 
+    def _font_background_color(self) -> QColor | None:
+        """None means no box at all -- either by the color's own alpha or
+        by font_background_opacity being 0. The two multiply rather than
+        either alone deciding: a translucent picked color still fades
+        further as opacity drops, and opacity=0 always means no box
+        regardless of what color was picked."""
+        s = self.settings
+        color = QColor(s.font_background_color)
+        color.setAlpha(round(color.alpha() * (s.font_background_opacity / 100)))
+        return color if color.alpha() > 0 else None
+
     def _render_caption_view(self) -> None:
-        blocks = [self._format_entry_html(e) for e in self._caption_entries]
+        s = self.settings
+        entries = list(self._caption_entries)
         if self._current_partial_entry is not None:
-            blocks.append(self._format_entry_html(self._current_partial_entry))
+            entries.append(self._current_partial_entry)
 
-        self.caption_view.setHtml("<br>".join(blocks))
+        paragraphs: list[tuple[str, QColor, int, bool]] = []
+        for entry in entries:
+            paragraphs.extend(self._entry_paragraphs(entry))
+        plain_text = "\n".join(self._entry_plain_text(e) for e in entries)
 
-        # Unconditional, not "only if the user was already at the bottom":
-        # that smart-follow version kept proving unreliable in practice
-        # (was_at_bottom's own tolerance/staleness edge cases), so this
-        # always snaps to the bottom on every render instead of trying to
-        # preserve a reading-history scroll position.
-        #
-        # Neither scrollbar.setValue(scrollbar.maximum()) nor
-        # moveCursor(End) right here are reliable on their own: QTextEdit's
-        # document layout is still settling synchronously after setHtml()
-        # returns, so maximum() can read stale (one render behind), and
-        # moveCursor's "scroll the new position into view" side effect
-        # depends on cursor-visibility bookkeeping that a read-only,
-        # never-focused QTextEdit doesn't reliably trigger. Deferring to
-        # the next event-loop turn (after layout has actually finished)
-        # and then setting the scrollbar value directly is what actually,
-        # reliably lands at the true bottom.
-        QTimer.singleShot(0, self._scroll_caption_to_bottom)
+        self.caption_view.render(
+            paragraphs, plain_text,
+            font_background=self._font_background_color(),
+            outline_color=QColor(s.outline_color),
+            outline_width=s.outline_width,
+        )
 
-    def _scroll_caption_to_bottom(self) -> None:
-        scrollbar = self.caption_view.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
-    def _reposition_caption_icons(self) -> None:
+    def _reposition_caption_overlays(self) -> None:
         margin = 6
-        # The scrollbar now always occupies its own strip on the right
-        # (see _build_caption_panel) -- keep the icons clear of it rather
-        # than floating over it.
+        # The scrollbar always occupies its own strip on the right (see
+        # caption_view.py) -- keep the icons clear of it rather than
+        # floating over it.
         scrollbar_width = self.caption_view.verticalScrollBar().sizeHint().width()
         width = self.caption_view.width() - scrollbar_width
         y = margin
@@ -640,8 +633,16 @@ class OverlayWindow(QWidget):
         self.copy_btn.raise_()
         self.clear_btn.raise_()
 
+        # Inset a couple pixels in from the bottom and from the
+        # scrollbar's left edge -- "slightly inside and to the left of
+        # the scroll bar."
+        grip_x = width - self.size_grip.width() - 2
+        grip_y = self.caption_view.height() - self.size_grip.height() - 2
+        self.size_grip.move(grip_x, grip_y)
+        self.size_grip.raise_()
+
     def _handle_copy_transcript(self) -> None:
-        QApplication.clipboard().setText(self.caption_view.toPlainText())
+        QApplication.clipboard().setText(self.caption_view.to_plain_text())
 
     def _handle_clear_transcript(self) -> None:
         self._caption_entries = []
@@ -708,7 +709,7 @@ class OverlayWindow(QWidget):
                 self.clear_btn.setVisible(False)
 
         if obj is self.caption_view and event.type() == QEvent.Type.Resize:
-            self._reposition_caption_icons()
+            self._reposition_caption_overlays()
 
         return super().eventFilter(obj, event)
 
@@ -771,10 +772,11 @@ class OverlayWindow(QWidget):
         s = self.settings
         # background_color/background_opacity is the app window's own
         # translucency -- the floating toolbar/caption panel/footer chrome
-        # -- not the caption text (that's outline_color/outline_width, on
-        # the text itself; see _wrap_text_outline). Restored to that after
-        # a round where it was temporarily repurposed as a text highlight;
-        # this is the original, correct scope.
+        # -- not the caption text (that's outline_color/outline_width and
+        # font_background_color/opacity, painted directly in
+        # caption_view.py). Restored to that after a round where it was
+        # temporarily repurposed as a text highlight; this is the
+        # original, correct scope.
         alpha = int(s.background_opacity / 100 * 255)
         bg = QColor(s.background_color)
         bg_rgba = f"rgba({bg.red()}, {bg.green()}, {bg.blue()}, {alpha})"
@@ -847,8 +849,7 @@ class OverlayWindow(QWidget):
                 border: none;
             }}
         """)
-        self.caption_view.setFont(QFont(s.font_family, s.font_size))
-        self.caption_view.viewport().setStyleSheet("background: transparent;")
+        self.caption_view.set_base_font(QFont(s.font_family, s.font_size))
         self._render_caption_view()
 
     # -- window dragging (frameless -> drag from anywhere) ----------------

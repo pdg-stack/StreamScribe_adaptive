@@ -23,9 +23,9 @@ class LineIconButton(QAbstractButton):
         self.setFixedSize(ICON_SIZE, ICON_SIZE)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         # Explicit, not just relying on QAbstractButton's default: this is
-        # a child of the caption QTextEdit now (floats over the top-right
-        # corner rather than sharing a layout row with it), and must never
-        # paint a background that would sit over the text underneath it.
+        # a child of the caption view (floats over the top-right corner
+        # rather than sharing a layout row with it), and must never paint
+        # a background that would sit over the text underneath it.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setStyleSheet("background: transparent; border: none;")
 

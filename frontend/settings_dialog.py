@@ -167,29 +167,47 @@ class SettingsDialog(QWidget):
 
         text_label = QLabel("Caption text")
         text_label.setStyleSheet(SECTION_LABEL_STYLE)
-        text_label.setToolTip("The caption text itself -- its fill color and the outline framing it.")
+        text_label.setToolTip(
+            "The caption text itself: its fill color, an optional highlight rectangle behind "
+            "each line (like YouTube's caption background), and an outline following the "
+            "shape of the letters themselves."
+        )
         layout.addWidget(text_label)
 
         color_row = QHBoxLayout()
         self.font_color_btn = self._build_color_button("Font", "font_color", "Caption text color.")
+        self.font_bg_color_btn = self._build_color_button(
+            "Font background", "font_background_color",
+            "Highlight rectangle behind each caption line (like YouTube's caption background) -- "
+            "independent of the outline and of the overlay panel below. Pick a transparent color, "
+            "or set its opacity to 0, for no background box at all."
+        )
         self.outline_color_btn = self._build_color_button(
             "Outline", "outline_color",
-            "Outline color around the caption text itself -- helps the text stand out when "
-            "font color and whatever's behind it are close in color."
+            "Outline color following the actual shape of the caption text's letters -- helps "
+            "the text stand out when its fill color is close to whatever's behind it."
         )
         color_row.addWidget(self.font_color_btn)
+        color_row.addWidget(self.font_bg_color_btn)
         color_row.addWidget(self.outline_color_btn)
         layout.addLayout(color_row)
 
-        outline_form = QFormLayout()
+        text_form = QFormLayout()
+        self.font_bg_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.font_bg_opacity_slider.setRange(0, 100)
+        self.font_bg_opacity_slider.setValue(s.font_background_opacity)
+        self.font_bg_opacity_slider.setToolTip("Opacity of the font background highlight (0 = no box).")
+        self.font_bg_opacity_slider.valueChanged.connect(lambda v: self._update("font_background_opacity", v))
+        text_form.addRow("Font background opacity", self.font_bg_opacity_slider)
+
         self.outline_width_spin = QSpinBox()
         self.outline_width_spin.setRange(0, 10)
         self.outline_width_spin.setSuffix(" px")
         self.outline_width_spin.setValue(s.outline_width)
-        self.outline_width_spin.setToolTip("Outline width around the caption text, in pixels (0 = no outline).")
+        self.outline_width_spin.setToolTip("Outline width around the caption text's letters, in pixels (0 = no outline).")
         self.outline_width_spin.valueChanged.connect(lambda v: self._update("outline_width", v))
-        outline_form.addRow("Text outline width", self.outline_width_spin)
-        layout.addLayout(outline_form)
+        text_form.addRow("Text outline width", self.outline_width_spin)
+        layout.addLayout(text_form)
 
         window_label = QLabel("App window")
         window_label.setStyleSheet(SECTION_LABEL_STYLE)
@@ -249,10 +267,16 @@ class SettingsDialog(QWidget):
 
     @staticmethod
     def _paint_color_button(btn: QPushButton, hex_color: str) -> None:
-        text_color = "#000000" if QColor(hex_color).lightnessF() > 0.5 else "#ffffff"
+        color = QColor(hex_color)
+        text_color = "#000000" if color.lightnessF() > 0.5 else "#ffffff"
+        # rgba(...), not the raw hex string: Qt's QSS color parser doesn't
+        # understand the #AARRGGBB form QColor.name(HexArgb) produces (QSS
+        # expects #RRGGBB or rgba(r,g,b,a)), so a translucent pick would
+        # otherwise paint the swatch as a wrong/garbled color.
+        bg = f"rgba({color.red()}, {color.green()}, {color.blue()}, {color.alphaF():.3f})"
         btn.setStyleSheet(
             f"QPushButton#colorButton {{"
-            f"  background-color: {hex_color}; color: {text_color};"
+            f"  background-color: {bg}; color: {text_color};"
             f"  border: 1px solid #666666; border-radius: 4px; padding: 6px;"
             f"}}"
         )
@@ -452,10 +476,32 @@ class SettingsDialog(QWidget):
 
     def _pick_color(self, field: str, btn: QPushButton) -> None:
         initial = QColor(getattr(self.settings, field))
-        color = QColorDialog.getColor(initial, self)
-        if color.isValid():
-            self._update(field, color.name())
-            self._paint_color_button(btn, color.name())
+        for i, hex_color in enumerate(self.settings.custom_colors[:16]):
+            QColorDialog.setCustomColor(i, QColor(hex_color))
+
+        color = QColorDialog.getColor(
+            initial, self, "Pick a color", QColorDialog.ColorDialogOption.ShowAlphaChannel
+        )
+        if not color.isValid():
+            return
+
+        # Only bother with the 8-digit #AARRGGBB form when there's real
+        # transparency to keep -- otherwise the plain 6-digit form, so
+        # existing (pre-transparency) storage/QSS interpolation of these
+        # fields is untouched for the common fully-opaque case.
+        hex_value = color.name() if color.alpha() == 255 else color.name(QColor.NameFormat.HexArgb)
+        self._update(field, hex_value)
+        self._paint_color_button(btn, hex_value)
+        self._remember_custom_color(hex_value)
+
+    def _remember_custom_color(self, hex_color: str) -> None:
+        # QColorDialog's own custom-color swatches are process-lifetime
+        # only; persisting our own list (and repopulating the dialog's
+        # swatches from it above) is what makes them survive a restart.
+        colors = [c for c in self.settings.custom_colors if c.lower() != hex_color.lower()]
+        colors.insert(0, hex_color)
+        self.settings.custom_colors = colors[:16]
+        self.settings.save()
 
     def _update_tier_enabled(self) -> None:
         self.tier_combo.setEnabled(self.engine_combo.currentData() == "faster-whisper")
