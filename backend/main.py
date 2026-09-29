@@ -31,6 +31,9 @@ Control messages in (JSON text frames):
         optional -- see modal_engine.py's deploy_and_warm_up; blank/omitted
         falls back to whatever ambient Modal auth the container has)
     {"type": "stop_modal"}
+    {"type": "set_paused", "paused": bool}  (sent when the frontend's pause
+        button toggles; see VadSegmenter.force_close -- without this the
+        backend has no way to know audio stopped mid-speech)
 
 Modal status events out (see transcription/modal_engine.py):
     {"type": "modal_setup_status",
@@ -174,6 +177,26 @@ async def _handle_modal_stop(websocket: WebSocket, engines: dict, state: Connect
     await _send_modal_status(websocket, send_lock, "terminated")
 
 
+async def _send_idle(
+    websocket: WebSocket, engines: dict, state: ConnectionState, queue: SegmentQueue,
+    sequencer: ResultSequencer, send_lock: asyncio.Lock,
+) -> None:
+    # Through the sequencer (not sent directly), at the seq "one past
+    # everything pushed so far" -- see ResultSequencer.submit_idle for why:
+    # sent directly, this could race ahead of a still-in-flight segment's
+    # result and get overwritten by it, leaving the status light showing
+    # stale strain with nothing left to ever correct it once audio
+    # actually stops.
+    idle_message = {
+        "type": "idle",
+        "model_tier": engines[state.engine_name].model_tier,
+        "cpu_status": "off",
+        "queue_length": len(queue),
+        "workers": PARALLEL_WORKERS,
+    }
+    await sequencer.submit_idle(queue.next_seq, idle_message, websocket, send_lock)
+
+
 async def _receiver(
     websocket: WebSocket, segmenter: VadSegmenter, queue: SegmentQueue, state: ConnectionState,
     send_lock: asyncio.Lock, engines: dict, sequencer: ResultSequencer,
@@ -199,21 +222,7 @@ async def _receiver(
                 was_speaking = True
 
             if was_speaking and not segmenter.in_speech:
-                # Through the sequencer (not sent directly), at the seq
-                # "one past everything pushed so far" -- see
-                # ResultSequencer.submit_idle for why: sent directly, this
-                # could race ahead of a still-in-flight segment's result
-                # and get overwritten by it, leaving the status light
-                # showing stale strain with nothing left to ever correct
-                # it once audio actually stops.
-                idle_message = {
-                    "type": "idle",
-                    "model_tier": engines[state.engine_name].model_tier,
-                    "cpu_status": "off",
-                    "queue_length": len(queue),
-                    "workers": PARALLEL_WORKERS,
-                }
-                await sequencer.submit_idle(queue.next_seq, idle_message, websocket, send_lock)
+                await _send_idle(websocket, engines, state, queue, sequencer, send_lock)
                 was_speaking = False
 
         elif message.get("text") is not None:
@@ -238,6 +247,21 @@ async def _receiver(
                 asyncio.create_task(_handle_modal_setup(websocket, engines, state, send_lock, token_id, token_secret))
             elif control_type == "stop_modal":
                 asyncio.create_task(_handle_modal_stop(websocket, engines, state, send_lock))
+            elif control_type == "set_paused":
+                if control.get("paused", False):
+                    # No more audio bytes are coming until resumed, so the
+                    # normal "next frame arrives and notices speech ended"
+                    # path (right above) can never fire on its own --
+                    # without this, pausing mid-speech would leave
+                    # in_speech stuck True and this connection would never
+                    # emit another idle transition, stalling the frontend's
+                    # queue/status light with nothing left to unstick them.
+                    for event in segmenter.force_close():
+                        queue.push(event)
+                        was_speaking = True
+                    if was_speaking:
+                        await _send_idle(websocket, engines, state, queue, sequencer, send_lock)
+                        was_speaking = False
 
 
 async def _processor(
