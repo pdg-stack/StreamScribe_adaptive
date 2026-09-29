@@ -22,6 +22,7 @@ second concurrent container). Simplified for this app's shape:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Callable
@@ -99,10 +100,27 @@ class ModalEngine:
     def model_tier(self) -> str:
         return f"modal:{self.model_name}"
 
-    def deploy_and_warm_up(self, on_status: Callable[[str], None]) -> None:
+    def deploy_and_warm_up(
+        self, on_status: Callable[[str], None], token_id: str | None = None, token_secret: str | None = None,
+    ) -> None:
         """Synchronous -- call via asyncio.to_thread from main.py. Reports
         "deploying" -> "warming up" -> "ready" through on_status, matching
-        the plan's modal_setup_status event stream."""
+        the plan's modal_setup_status event stream.
+
+        `token_id`/`token_secret`, if given, authenticate this call via
+        Modal's documented MODAL_TOKEN_ID/MODAL_TOKEN_SECRET env vars
+        instead of relying on the ambient `modal token set` CLI login this
+        module's docstring originally assumed -- that assumption doesn't
+        hold once this runs inside Docker, since the container doesn't
+        inherit the host's ~/.modal.toml. Left as None/blank, falls back
+        to whatever ambient auth the container happens to have (unchanged
+        behavior). Set *before* `import modal`: the SDK reads them at
+        first use, and this module deliberately imports modal lazily so
+        merely importing this file never requires credentials."""
+        if token_id and token_secret:
+            os.environ["MODAL_TOKEN_ID"] = token_id
+            os.environ["MODAL_TOKEN_SECRET"] = token_secret
+
         import modal
 
         on_status("deploying")
