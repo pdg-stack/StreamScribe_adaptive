@@ -61,6 +61,7 @@ from backend.config import (
     MODEL_TIERS,
     PARALLEL_WORKERS,
 )
+from backend import log_viewer
 from backend.logging_config import log
 from backend.transcription.engine import AdaptiveEngine, get_model
 from backend.transcription.modal_engine import ModalEngine
@@ -96,6 +97,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="StreamScribe_adaptive backend", lifespan=lifespan)
+app.include_router(log_viewer.router)
 
 
 @app.get("/health")
