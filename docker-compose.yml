@@ -9,6 +9,7 @@ services:
       - D:/Work/Docker/shared-model-cache:/root/.cache
       - ./logs/backend:/app/logs
       - ./frontend/logs:/app/frontend_logs:ro
+      - ./frontend/data:/app/frontend_data:ro
     restart: unless-stopped
 
   # Live container-log viewer (search, level highlighting, tail) for the
