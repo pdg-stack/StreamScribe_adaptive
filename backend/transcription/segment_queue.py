@@ -5,6 +5,20 @@ more audio off the socket, and so backlog can be measured and preempted.
 One instance per WebSocket connection. Not thread-safe across OS threads --
 intended for use within a single asyncio event loop, where the lack of an
 `await` between mutating operations already prevents interleaving.
+
+PLAIN-ENGLISH OVERVIEW (for anyone new to this file):
+This is a to-do list ("queue") of chunks of speech waiting to be
+transcribed. Two different parts of the program share it:
+  - one part's only job is to keep listening to incoming audio and drop
+    finished chunks ("segments") onto this list (push);
+  - another part (main.py's _processor) picks chunks off the list one at a
+    time and does the actual (slow) work of transcribing + translating
+    them (pop).
+Keeping these two jobs separate means "listening" never has to pause and
+wait for "transcribing" to finish -- audio keeps getting captured smoothly
+even while a slow segment is still being worked on. That's the entire
+reason this class exists instead of just processing each segment the
+instant it's ready.
 """
 
 from __future__ import annotations
@@ -40,17 +54,29 @@ class SegmentQueue:
         return self._next_seq
 
     def push(self, event: SegmenterEvent) -> None:
+        """Add one finished chunk of speech to the end of the list.
+        Called by main.py's _receiver as soon as the VAD segmenter decides
+        a chunk is ready (see vad_segmenter.py)."""
         self._items.append(QueuedSegment(event=event, enqueued_at=time.time(), seq=self._next_seq))
         self._next_seq += 1
+        # Wakes up anything that's currently sitting in pop() below, waiting
+        # for "there's now at least one item" -- see pop()'s comment.
         self._not_empty.set()
 
     async def pop(self) -> QueuedSegment:
+        """Take the oldest chunk off the front of the list and return it,
+        for a worker to actually transcribe. If the list is currently
+        empty, this waits (without spinning/burning CPU) until push()
+        above adds something, then tries again."""
         while not self._items:
             self._not_empty.clear()
             await self._not_empty.wait()
         return self._items.popleft()
 
     def record_processing_time(self, elapsed: float) -> None:
+        """Remembers how long the last few segments took to transcribe, so
+        preempt_if_needed() below can estimate how long a newly queued
+        segment will have to wait its turn."""
         self._processing_times.append(elapsed)
         self._processing_times = self._processing_times[-PROCESSING_TIME_WINDOW:]
 

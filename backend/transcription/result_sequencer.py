@@ -12,6 +12,23 @@ the acceptable-latency threshold, in which case it's skipped rather than
 held up for, exactly like the existing delayed/preemption logic elsewhere
 in this pipeline (frontend's DELAYED_FACTOR, this backend's
 QUEUE_PREEMPTION_FACTOR) gives up waiting rather than blocking forever.
+
+PLAIN-ENGLISH OVERVIEW (for anyone new to this file):
+Think of it like a numbered ticket queue at a counter, e.g. "now serving
+#4". Segments get a number when they're first captured (#0, #1, #2...).
+Because more than one segment can be transcribed at once, #2 might finish
+before #1 does. This class holds #2's answer back ("pending") until #1's
+answer arrives too, so they still go out to the app's screen in the right
+order (#1 then #2), never #2 before #1.
+The one exception: if #1 is taking way too long (past the acceptable-delay
+setting), we stop waiting for it, skip straight to serving #2, and just
+throw #1's answer away whenever/if it eventually shows up -- better a
+short gap than freezing everything behind one slow segment forever.
+The periodic "ticker" (see main.py's _sequencer_ticker, called every 0.2s)
+is what actually notices "#1 has been waiting too long" even when nothing
+else is happening -- if that ticker ever stops running, the whole queue
+can appear to freeze even though individual segments are still being
+transcribed fine behind the scenes.
 """
 
 from __future__ import annotations
@@ -24,6 +41,18 @@ from fastapi import WebSocket
 
 from backend.config import QUEUE_PREEMPTION_FACTOR
 from backend.logging_config import log
+
+# How long a single websocket.send_text() may take before we give up on it.
+# _flush() below sends WHILE holding self._lock (see its docstring), so an
+# indefinitely hanging send -- a stalled network connection that hasn't
+# been noticed as dead yet -- would freeze every future call into this
+# class forever, not just this one message. A timeout turns that into "one
+# send fails, gets logged, the connection tears down normally" instead.
+SEND_TIMEOUT_S = 5.0
+
+
+async def _send(websocket: WebSocket, message: dict) -> None:
+    await asyncio.wait_for(websocket.send_text(json.dumps(message)), timeout=SEND_TIMEOUT_S)
 
 
 class ResultSequencer:
@@ -93,7 +122,7 @@ class ResultSequencer:
             if seq <= self._next_seq:
                 message["timestamp"] = time.time()
                 async with send_lock:
-                    await websocket.send_text(json.dumps(message))
+                    await _send(websocket, message)
                 return
             self._pending[seq] = message
             await self._flush(websocket, send_lock)
@@ -109,6 +138,12 @@ class ResultSequencer:
 
     async def _flush(self, websocket: WebSocket, send_lock: asyncio.Lock, acceptable_latency: float | None = None) -> None:
         # Caller holds self._lock.
+        # In plain terms: "keep serving the next ticket number for as long
+        # as we can." Each pass through this loop handles ONE outcome for
+        # whatever self._next_seq currently is, then either moves on to the
+        # next number (continue) or stops because that number genuinely
+        # isn't ready yet (break) -- there's nothing more useful to do
+        # until either a new result comes in or the ticker calls this again.
         while True:
             if self._next_seq in self._abandoned:
                 self._abandoned.discard(self._next_seq)
@@ -119,7 +154,7 @@ class ResultSequencer:
                 message = self._pending.pop(self._next_seq)
                 message["timestamp"] = time.time()
                 async with send_lock:
-                    await websocket.send_text(json.dumps(message))
+                    await _send(websocket, message)
                 self._next_seq += 1
                 continue
 
