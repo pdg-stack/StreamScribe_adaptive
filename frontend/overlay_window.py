@@ -439,9 +439,19 @@ class OverlayWindow(QWidget):
         self._current_tier = new_tier
         self._update_advanced_pane()
         if kind in ("partial", "final"):
+            # Full text, not just a length -- this is the raw text/
+            # translated_text exactly as received from the backend
+            # pipeline, before any of this file's own display logic
+            # (same-language collapsing, show_source_transcript,
+            # _shown_source_dest below) decides what actually gets
+            # rendered. The transcript history DB only ever stores the
+            # latter (see _record_caption_event/_shown_source_dest) --
+            # diffing a DB row against the matching line here is how a
+            # bug in the FE rendering path (as opposed to the ASR/
+            # translation engines themselves) would show up.
             log.info(
-                "[Transcript] kind=%s cpu=%s tier=%s text_len=%d",
-                kind, event.get("cpu_status"), new_tier, len(event.get("text", "")),
+                "[Transcript] kind=%s cpu=%s tier=%s text=%r translated_text=%r",
+                kind, event.get("cpu_status"), new_tier, event.get("text", ""), event.get("translated_text", ""),
             )
 
         detected = event.get("detected_lang")
@@ -608,14 +618,20 @@ class OverlayWindow(QWidget):
         # next to it. Nothing meaningful to show there in that case.
         self.advanced_size_label.setText(f"Size: {tier}" if tier != "parakeet" else "Size: —")
 
-    def _entry_paragraphs(self, entry: dict) -> list[tuple[str, QColor, int, bool]]:
-        """One caption entry -> one or two (text, color, font_size, italic)
-        paragraphs for CaptionView.render() -- two when there's a
-        translated primary line plus a dimmer original secondary line."""
-        s = self.settings
-
+    def _shown_source_dest(self, entry: dict) -> tuple[str, str]:
+        """(source_text, dest_text) exactly as actually displayed for this
+        entry -- "" for whichever side has no distinct line shown (e.g.
+        dest_text=="" when same_lang collapses to a single line, or
+        source_text=="" when show_source_transcript is off). The single
+        place _entry_paragraphs, _entry_plain_text, and the transcript-
+        history DB write (_record_caption_event) all derive from, so what
+        gets saved to the DB can never drift from what's actually on
+        screen -- the raw engine text/translated_text this decision is
+        made FROM is what the [Transcript] log line records instead (see
+        handle_event), so the two can be diffed against each other to
+        isolate a rendering-side bug from an engine-side one."""
         if entry.get("marker") == "delayed":
-            return [("<delayed>", QColor(s.font_color), s.font_size, True)]
+            return "<delayed>", "<delayed>"
 
         raw_text = entry.get("text", "")
         raw_translated = entry.get("translated_text", "")
@@ -627,30 +643,36 @@ class OverlayWindow(QWidget):
         # detected_lang, so this is the only signal available there).
         same_lang = (bool(detected) and detected == dest_code) or raw_translated == raw_text
         if same_lang or not raw_translated:
-            return [(raw_text, QColor(s.font_color), s.font_size, False)]
-        if not s.show_source_transcript:
-            return [(raw_translated, QColor(s.font_color), s.font_size, False)]
+            return raw_text, ""
+        if not self.settings.show_source_transcript:
+            return "", raw_translated
+        return raw_text, raw_translated
 
-        dim = QColor(s.font_color)
-        dim.setAlpha(150)
-        return [
-            (raw_translated, QColor(s.font_color), s.font_size, False),
-            (raw_text, dim, max(s.font_size - 2, 8), False),
-        ]
+    def _entry_paragraphs(self, entry: dict) -> list[tuple[str, QColor, int, bool]]:
+        """One caption entry -> one or two (text, color, font_size, italic)
+        paragraphs for CaptionView.render() -- two when there's a
+        translated primary line plus a dimmer original secondary line."""
+        s = self.settings
+        if entry.get("marker") == "delayed":
+            return [("<delayed>", QColor(s.font_color), s.font_size, True)]
+
+        source_text, dest_text = self._shown_source_dest(entry)
+        if source_text and dest_text:
+            dim = QColor(s.font_color)
+            dim.setAlpha(150)
+            return [
+                (dest_text, QColor(s.font_color), s.font_size, False),
+                (source_text, dim, max(s.font_size - 2, 8), False),
+            ]
+        return [(dest_text or source_text, QColor(s.font_color), s.font_size, False)]
 
     def _entry_plain_text(self, entry: dict) -> str:
         if entry.get("marker") == "delayed":
             return "<delayed>"
-        raw_text = entry.get("text", "")
-        raw_translated = entry.get("translated_text", "")
-        detected = entry.get("detected_lang")
-        dest_code = entry.get("dest_code")
-        same_lang = (bool(detected) and detected == dest_code) or raw_translated == raw_text
-        if same_lang or not raw_translated:
-            return raw_text
-        if not self.settings.show_source_transcript:
-            return raw_translated
-        return f"{raw_translated}\n{raw_text}"
+        source_text, dest_text = self._shown_source_dest(entry)
+        if source_text and dest_text:
+            return f"{dest_text}\n{source_text}"
+        return dest_text or source_text
 
     def _record_caption_event(self, kind: str, event: dict) -> None:
         entry = {
@@ -684,9 +706,15 @@ class OverlayWindow(QWidget):
             source_lang = entry["detected_lang"] or (
                 None if self._is_auto_selected() else self.source_combo.currentData()
             )
+            # What's actually shown, not the raw engine text/translated_text
+            # -- see _shown_source_dest's docstring. The raw values are what
+            # the [Transcript] log line above already recorded, so a diff
+            # between that log and this DB row is exactly how a FE
+            # rendering bug (vs. an ASR/translation engine one) would show up.
+            shown_source, shown_dest = self._shown_source_dest(entry)
             self._queue_transcript_row(
                 is_delayed=False, start_ts=start_ts, end_ts=end_ts,
-                source_text=entry["text"], dest_text=entry["translated_text"],
+                source_text=shown_source, dest_text=shown_dest,
                 source_lang=source_lang, dest_lang=entry["dest_code"],
                 auto_detect=self._is_auto_selected(),
             )
