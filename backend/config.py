@@ -39,6 +39,11 @@ DEFAULT_ENGINE = "faster-whisper"
 # languages to what's actually available per engine.
 PARAKEET_MODEL_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2"
 PARAKEET_CACHE_DIR = "/root/.cache/streamscribe/parakeet"
+# The exact 5 languages Parakeet's checkpoint covers (see parakeet_engine.py) --
+# used to constrain the text-based language guess in lang_guess.py to just
+# these candidates when Parakeet is the active engine, since it never
+# reports which one it actually transcribed.
+PARAKEET_LANGUAGES = ["ru", "es", "en", "it", "pt"]
 
 # Queue preemption: if the predicted wait for the newest queued segment
 # (queue depth ahead of it * recent average processing time) exceeds this
