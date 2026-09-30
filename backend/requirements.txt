@@ -1,0 +1,16 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+faster-whisper>=1.0
+webrtcvad>=2.0.10
+ctranslate2>=4.0
+sentencepiece>=0.2
+huggingface_hub>=0.24
+numpy>=1.26
+sherpa-onnx>=1.10
+modal>=0.65
+langid>=1.1.6
+
+# Only needed for the one-time NLLB-200 HF->CTranslate2 conversion on first
+# run (torch itself is installed separately in the Dockerfile, CPU-only
+# wheel). faster-whisper does not need torch -- it uses ctranslate2 directly.
+transformers>=4.40

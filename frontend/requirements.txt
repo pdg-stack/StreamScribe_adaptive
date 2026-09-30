@@ -1,0 +1,12 @@
+PyQt6>=6.11
+PyAudioWPatch>=0.2.12
+websockets>=17.1
+numpy>=1.26
+scipy>=1.18
+pycaw>=20240210
+comtypes>=1.4
+psutil>=7.0
+
+# Windows-only, all of it (WASAPI loopback capture + pycaw + this) --
+# there's no cross-platform fallback, this app doesn't run anywhere else.
+pywin32>=312

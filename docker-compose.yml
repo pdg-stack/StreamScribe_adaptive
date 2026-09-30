@@ -1,0 +1,25 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - D:/Work/Docker/shared-model-cache:/root/.cache
+      - ./logs/backend:/app/logs
+      - ./frontend/logs:/app/frontend_logs:ro
+    restart: unless-stopped
+
+  # Live container-log viewer (search, level highlighting, tail) for the
+  # backend's stdout -- lighter than a full Grafana/Loki stack. Only shows
+  # the backend here: frontend.py runs natively outside Docker (see plan),
+  # so its log stays covered by the /logs web page (backend/log_viewer.py)
+  # instead, which Dozzle has no way to reach.
+  dozzle:
+    image: amir20/dozzle:latest
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped

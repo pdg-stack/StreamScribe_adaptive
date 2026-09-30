@@ -1,0 +1,150 @@
+"""WebSocket client: streams captured PCM to the backend and delivers
+parsed transcript/translation/status JSON events back via callback.
+Reconnects automatically if the backend isn't running yet or drops.
+
+PLAIN-ENGLISH OVERVIEW (for anyone new to this file):
+A "WebSocket" is just a two-way, always-open network connection -- unlike
+a normal web request (ask once, get one answer, done), it stays open so
+either side can send messages to the other at any time. This class owns
+that connection to the backend running in Docker. It runs on its own
+background thread (see start()) so that sending/receiving over the network
+never freezes the app's window -- Qt (the UI toolkit this app's window is
+built with) needs its own thread free at all times to stay responsive.
+Two small queues (see __init__) are how the rest of the app hands things
+to this background thread safely: audio bytes go in `_audio_queue`,
+settings/control changes go in `_control_queue`. _connect_loop() below is
+the main loop: connect, then run sending and receiving at the same time
+until something goes wrong, then wait a couple seconds and try again --
+forever, for as long as the app is open.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import queue
+import threading
+from collections.abc import Callable
+
+import websockets
+from websockets.exceptions import WebSocketException
+
+from .logging_config import log
+
+BACKEND_URI = "ws://127.0.0.1:8000/ws/transcribe"
+RECONNECT_DELAY_S = 2
+
+
+class WsClient:
+    """Runs its own asyncio event loop on a background thread so the Qt
+    main thread never blocks on network I/O. `send_audio()` and
+    `set_dst_lang()` are safe to call from the Qt thread."""
+
+    def __init__(
+        self,
+        on_event: Callable[[dict], None],
+        on_connection_change: Callable[[bool], None] | None = None,
+    ) -> None:
+        self._on_event = on_event
+        self._on_connection_change = on_connection_change
+        self._audio_queue: queue.Queue[bytes] = queue.Queue()
+        self._control_queue: queue.Queue[dict] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def send_audio(self, pcm_bytes: bytes) -> None:
+        self._audio_queue.put(pcm_bytes)
+
+    def set_dst_lang(self, lang: str) -> None:
+        self._control_queue.put({"type": "set_dst_lang", "lang": lang})
+
+    def set_src_lang(self, lang: str) -> None:
+        self._control_queue.put({"type": "set_src_lang", "lang": lang})
+
+    def set_engine(self, engine: str) -> None:
+        self._control_queue.put({"type": "set_engine", "engine": engine})
+
+    def set_tier(self, tier: str) -> None:
+        self._control_queue.put({"type": "set_tier", "tier": tier})
+
+    def set_acceptable_latency(self, seconds: float) -> None:
+        self._control_queue.put({"type": "set_acceptable_latency", "seconds": seconds})
+
+    def set_paused(self, paused: bool) -> None:
+        # Tells the backend, not just this client, that no more audio is
+        # coming for now -- without this, pausing mid-speech leaves the
+        # backend's segmenter waiting forever for a next audio frame to
+        # notice speech has ended (see backend/main.py's set_paused
+        # handling), stalling the queue/status light with nothing left to
+        # ever unstick them.
+        self._control_queue.put({"type": "set_paused", "paused": paused})
+
+    def start_modal_setup(self, token_id: str = "", token_secret: str = "") -> None:
+        self._control_queue.put({"type": "start_modal_setup", "token_id": token_id, "token_secret": token_secret})
+
+    def stop_modal(self) -> None:
+        self._control_queue.put({"type": "stop_modal"})
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._connect_loop())
+
+    async def _connect_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(BACKEND_URI) as ws:
+                    if self._on_connection_change:
+                        self._on_connection_change(True)
+                    await asyncio.gather(self._sender(ws), self._receiver(ws))
+            except (OSError, WebSocketException) as exc:
+                log.info("WS connection lost/unavailable, retrying: %r", exc)
+                if self._on_connection_change:
+                    self._on_connection_change(False)
+                await asyncio.sleep(RECONNECT_DELAY_S)
+            except Exception:
+                # Anything else (a malformed event's json.JSONDecodeError,
+                # a bug in the on_event callback, ...) previously escaped
+                # uncaught here, all the way out of _run() -- for a
+                # background thread (not the main thread), Python's
+                # default handling just prints a traceback and lets the
+                # thread die silently, permanently ending all networking
+                # for the rest of the session with nothing but a stderr
+                # line that scrolls away. Logged and retried instead, the
+                # same as a plain connection failure.
+                log.exception("Unexpected error in WS connect loop, retrying")
+                if self._on_connection_change:
+                    self._on_connection_change(False)
+                await asyncio.sleep(RECONNECT_DELAY_S)
+
+    async def _sender(self, ws) -> None:
+        while not self._stop.is_set():
+            while not self._control_queue.empty():
+                await ws.send(json.dumps(self._control_queue.get_nowait()))
+            try:
+                pcm = self._audio_queue.get_nowait()
+                await ws.send(pcm)
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+
+    async def _receiver(self, ws) -> None:
+        async for message in ws:
+            try:
+                self._on_event(json.loads(message))
+            except Exception:
+                # Guards json.loads() and this call itself (on_event is
+                # bridge.event_received.emit -- a queued cross-thread Qt
+                # signal, so the connected slot, overlay.handle_event,
+                # actually runs later on the Qt thread; a bug *there*
+                # surfaces via sys.excepthook in main.py instead, not
+                # here). Either way, one bad message must not take down
+                # this receive loop and silently end all further event
+                # delivery for the rest of the connection.
+                log.exception("Error handling an incoming message: %.200r", message)

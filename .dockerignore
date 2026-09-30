@@ -1,0 +1,10 @@
+.git
+frontend
+docs
+*.md
+native-requirements.txt
+backend/tests
+__pycache__
+*.pyc
+.venv
+venv
