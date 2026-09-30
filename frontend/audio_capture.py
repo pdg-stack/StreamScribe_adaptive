@@ -13,6 +13,8 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 from scipy.signal import resample_poly
 
+from .logging_config import log
+
 TARGET_SAMPLE_RATE = 16000
 CHUNK_FRAMES = 1024
 
@@ -66,14 +68,35 @@ class LoopbackCapture:
         up, down = TARGET_SAMPLE_RATE // g, rate // g
 
         def callback(in_data, frame_count, time_info, status):
-            audio = np.frombuffer(in_data, dtype=np.float32)
-            if channels > 1:
-                audio = audio.reshape(-1, channels).mean(axis=1)
-            resampled = resample_poly(audio, up, down)
-            pcm16 = np.clip(resampled * 32768.0, -32768, 32767).astype(np.int16)
-            self._on_audio(pcm16.tobytes())
-            if self._on_activity is not None and np.abs(pcm16).mean() > ACTIVITY_AMPLITUDE_THRESHOLD:
-                self._on_activity()
+            # This runs on PortAudio's own C-spawned thread, not a Python
+            # `threading.Thread` -- an uncaught exception here does NOT reach
+            # sys.excepthook/threading.excepthook (main.py's handlers only
+            # ever cover real Python threads), and PortAudio's ctypes callback
+            # wrapper is known to just stop invoking a callback that raised,
+            # with nothing surfacing anywhere but a stderr traceback that
+            # vanishes with the console. This was the prime suspect for a
+            # session where only the first audio segment was ever
+            # transcribed and nothing else showed up again -- unconfirmed
+            # from this one log alone, but every other path here already had
+            # this exact bug pattern this round, and this callback had zero
+            # protection. Every branch below must stay inside this try/except
+            # and keep returning paContinue, or one bad frame permanently
+            # kills audio input until the app is restarted.
+            try:
+                if status:
+                    log.warning("PortAudio callback status flag: %r", status)
+                if not in_data:
+                    return (None, pyaudio.paContinue)
+                audio = np.frombuffer(in_data, dtype=np.float32)
+                if channels > 1:
+                    audio = audio.reshape(-1, channels).mean(axis=1)
+                resampled = resample_poly(audio, up, down)
+                pcm16 = np.clip(resampled * 32768.0, -32768, 32767).astype(np.int16)
+                self._on_audio(pcm16.tobytes())
+                if self._on_activity is not None and np.abs(pcm16).mean() > ACTIVITY_AMPLITUDE_THRESHOLD:
+                    self._on_activity()
+            except Exception:
+                log.exception("PortAudio capture callback failed on one chunk -- continuing")
             return (None, pyaudio.paContinue)
 
         self._stream = self._pa.open(
