@@ -8,6 +8,8 @@ events:
      "cpu_status": "green"|"yellow"|"red"|"off",
      "segment_closed_at": float, "queue_length": int, "workers": int, "timestamp": float}
 
+    {"type": "queue_update", "queue_length": int, "workers": int}
+
 ("workers" is PARALLEL_WORKERS, config.py -- static for the process's
 lifetime, sent on every event since there's no dedicated handshake message
 for it yet.)
@@ -15,6 +17,14 @@ for it yet.)
 ("idle" events omit text/detected_lang/translated_text/segment_closed_at --
 they only fire once on the transition into silence, so the frontend can
 turn its CPU-strain light off without guessing from a timeout.)
+
+("queue_update" is a pure gauge broadcast -- sent every 200ms by
+_sequencer_ticker, and immediately after set_tier/set_engine flushes
+backlog -- so the frontend's Queue display reflects reality quickly after
+ANY change to the real queue, not only when a transcript/idle event
+happens to also be going out. Bypasses ResultSequencer's ordering
+entirely: a stale queue_length is harmless, it just self-corrects on the
+next one.)
 
 Receiving audio and processing it run as two concurrent tasks (see
 transcription/segment_queue.py) so a slow segment never blocks reading
@@ -203,6 +213,40 @@ async def _send_idle(
     await sequencer.submit_idle(queue.next_seq, idle_message, websocket, send_lock)
 
 
+async def _send_queue_update(websocket: WebSocket, queue: SegmentQueue, send_lock: asyncio.Lock) -> None:
+    """A lightweight, order-independent gauge update -- unlike transcript
+    text, a stale queue_length is harmless (it just self-corrects on the
+    next send), so this bypasses ResultSequencer entirely rather than
+    waiting for its strict in-order delivery. Sent directly so the
+    frontend's Queue display can converge on the real backend depth
+    quickly after ANY change -- preemption, a segment finishing, an
+    engine/tier switch -- not only when a transcript event happens to also
+    be going out. _sequencer_ticker calls this every 200ms unconditionally
+    (see its own docstring) as the general-purpose fix; callers that cause
+    an immediate, user-visible drop (set_tier/set_engine below) also call
+    it directly so that one doesn't wait out even the 200ms tick."""
+    message = {"type": "queue_update", "queue_length": len(queue), "workers": PARALLEL_WORKERS}
+    async with send_lock:
+        await websocket.send_text(json.dumps(message))
+
+
+async def _flush_queue_on_model_change(
+    queue: SegmentQueue, sequencer: ResultSequencer, websocket: WebSocket, send_lock: asyncio.Lock,
+) -> None:
+    """Called right after the active engine or tier changes. Backlog
+    that's still queued was captured before this switch -- there's no
+    reason to keep grinding through it under the new model before fresh
+    audio gets a turn, so it's dropped outright (like preempt_if_needed's
+    reasoning, just triggered by a settings change instead of latency) and
+    the frontend is told the queue is empty right away rather than waiting
+    to find out from whatever event happens to be sent next."""
+    dropped = queue.clear()
+    if dropped:
+        log.info("Flushed %d queued segment(s) on model change: seqs=%s", len(dropped), dropped)
+        await sequencer.mark_abandoned(dropped, websocket, send_lock)
+    await _send_queue_update(websocket, queue, send_lock)
+
+
 async def _receiver(
     websocket: WebSocket, segmenter: VadSegmenter, queue: SegmentQueue, state: ConnectionState,
     send_lock: asyncio.Lock, engines: dict, sequencer: ResultSequencer,
@@ -254,10 +298,12 @@ async def _receiver(
                 state.acceptable_latency = float(control.get("seconds", state.acceptable_latency))
             elif control_type == "set_tier":
                 engines["faster-whisper"].set_tier_mode(control.get("tier", "auto"))
+                await _flush_queue_on_model_change(queue, sequencer, websocket, send_lock)
             elif control_type == "set_engine":
                 requested = control.get("engine", DEFAULT_ENGINE)
                 if requested in ("faster-whisper", "parakeet"):
                     state.engine_name = requested
+                    await _flush_queue_on_model_change(queue, sequencer, websocket, send_lock)
             elif control_type == "start_modal_setup":
                 token_id = control.get("token_id") or None
                 token_secret = control.get("token_secret") or None
@@ -419,7 +465,9 @@ async def _process_one_segment(
     await sequencer.submit_result(item.seq, message, state.acceptable_latency, websocket, send_lock)
 
 
-async def _sequencer_ticker(sequencer: ResultSequencer, state: ConnectionState, websocket: WebSocket, send_lock: asyncio.Lock) -> None:
+async def _sequencer_ticker(
+    sequencer: ResultSequencer, state: ConnectionState, queue: SegmentQueue, websocket: WebSocket, send_lock: asyncio.Lock,
+) -> None:
     """Periodic nudge so a segment stuck in flight gets skipped promptly
     even if no *other* segment happens to complete right after it stalls
     -- submit_result() alone only re-checks staleness when something new
@@ -432,11 +480,20 @@ async def _sequencer_ticker(sequencer: ResultSequencer, state: ConnectionState, 
     stuck forever too (ResultSequencer only ever delivers in order), which
     looks exactly like "the queue is stuck / stopped processing" from the
     outside. Same fix as _processor below: never let one bad tick kill the
-    whole loop silently."""
+    whole loop silently.
+
+    Also unconditionally broadcasts the current queue length every tick
+    (_send_queue_update) -- this used to only ever reach the frontend
+    piggybacked on a transcript/idle event, so anything that shrank the
+    real queue without also sending one of those (a preempted/abandoned
+    backlog, mainly) left the frontend's Queue display stuck showing a
+    stale, too-high number with nothing left to correct it. Now it's
+    always at most 200ms stale, regardless of why the real queue changed."""
     while True:
         await asyncio.sleep(0.2)
         try:
             await sequencer.tick(state.acceptable_latency, websocket, send_lock)
+            await _send_queue_update(websocket, queue, send_lock)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -472,7 +529,7 @@ async def ws_transcribe(websocket: WebSocket) -> None:
         asyncio.create_task(_processor(websocket, engines, queue, state, send_lock, sequencer))
         for _ in range(PARALLEL_WORKERS)
     ]
-    ticker_task = asyncio.create_task(_sequencer_ticker(sequencer, state, websocket, send_lock))
+    ticker_task = asyncio.create_task(_sequencer_ticker(sequencer, state, queue, websocket, send_lock))
 
     try:
         await receiver_task

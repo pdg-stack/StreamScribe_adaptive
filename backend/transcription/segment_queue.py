@@ -104,5 +104,17 @@ class SegmentQueue:
             return dropped_seqs
         return []
 
+    def clear(self) -> list[int]:
+        """Drops every currently queued (not yet popped) segment and
+        returns their seqs, so the caller can tell ResultSequencer they'll
+        never complete -- same contract as preempt_if_needed above. Used
+        when the active engine/tier changes: backlog queued under the OLD
+        model has no reason to keep draining under the new one, and
+        leaving it in place just delays how quickly fresh audio under the
+        new model starts showing up."""
+        dropped_seqs = [item.seq for item in self._items]
+        self._items.clear()
+        return dropped_seqs
+
     def __len__(self) -> int:
         return len(self._items)
