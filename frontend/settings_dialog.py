@@ -539,6 +539,13 @@ class SettingsDialog(QWidget):
         self._actions["on_latency_change"](value)
 
     def _handle_inference_mode_change(self, local_checked: bool) -> None:
+        # This toggle only ever changes ROUTING, never deploys or tears
+        # down the actual Modal container -- it used to call
+        # on_modal_stop_requested() when switching to Local, which
+        # genuinely destroyed a live GPU container just for flipping a
+        # radio button, forcing a full slow redeploy to get back to Cloud.
+        # The explicit Stop button (_handle_modal_stop below) is the only
+        # thing that still does that.
         mode = "local" if local_checked else "modal"
         self._update("inference_mode", mode)
         self._update_mode_pages()
@@ -546,8 +553,14 @@ class SettingsDialog(QWidget):
             # Modal only runs faster-whisper (see plan) -- force the engine
             # choice so there's nothing to silently route around.
             self._set_combo_code(self.engine_combo, "faster-whisper")
+            if self._modal_status in ("ready", "alive"):
+                # Already deployed (e.g. switched to Local and back) --
+                # resume routing to it directly, no redeploy needed. If
+                # it's not yet set up, there's nothing to resume; the user
+                # sees the "Set up Modal instance" button instead.
+                self._actions["on_engine_change"]("modal")
         else:
-            self._actions["on_modal_stop_requested"]()
+            self._actions["on_engine_change"](self.engine_combo.currentData())
 
     def _handle_modal_setup(self) -> None:
         # Read the fields directly rather than relying on editingFinished
