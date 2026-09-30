@@ -26,6 +26,7 @@ from backend.config import (
     RTF_GREEN_MAX,
     RTF_YELLOW_MAX,
     STRAIN_WINDOW,
+    WHISPER_TEMPERATURE,
 )
 
 _model_cache: dict[tuple[str, str], WhisperModel] = {}
@@ -185,7 +186,9 @@ class AdaptiveEngine:
         duration = len(audio) / sample_rate
 
         start = time.monotonic()
-        segments, info = model.transcribe(audio, language=language, beam_size=BEAM_SIZE)
+        segments, info = model.transcribe(
+            audio, language=language, beam_size=BEAM_SIZE, temperature=WHISPER_TEMPERATURE
+        )
         text = " ".join(s.text.strip() for s in segments).strip()
         elapsed = time.monotonic() - start
 

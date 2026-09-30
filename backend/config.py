@@ -6,6 +6,25 @@ import os
 
 BEAM_SIZE = 5
 
+# faster-whisper retries a decode that fails its own quality checks
+# (compression_ratio_threshold/log_prob_threshold, both left at their
+# library defaults) at progressively higher temperature -- its default
+# ladder is 6 steps ([0.0, 0.2, 0.4, 0.6, 0.8, 1.0]), and EACH step is a
+# full beam_size=5 decode pass, not a cheap retry. Confirmed via
+# production logs: on audio where the active tier is weakest (seen
+# concretely testing Hindi and Japanese, even at the "small" tier), a
+# single segment's processing time exploded to 17-29s -- against a
+# normal well-under-2s call -- while producing garbled, repetitive text.
+# That's the full 6-step ladder repeatedly failing its own checks and
+# retrying, not one call legitimately taking long; it explains both the
+# "very slow" and "poor success rate" symptoms together as one cause.
+# Capped to 2 steps here: still one real retry for a genuinely bad first
+# attempt, but bounds the worst case to ~2x a single decode instead of
+# ~6x -- matching this app's actual priority of bounded live latency
+# (queue preemption and PROCESSING_TIMEOUT_S both exist for exactly this
+# reason) over squeezing out the last bit of accuracy on hard audio.
+WHISPER_TEMPERATURE = (0.0, 0.4)
+
 # ASR fallback cascade, most-accurate first. "tiny" is the floor -- no
 # further fallback below it.
 MODEL_TIERS = ["small", "base", "tiny"]
