@@ -8,4 +8,5 @@ services:
     volumes:
       - D:/Work/Docker/shared-model-cache:/root/.cache
       - ./logs/backend:/app/logs
+      - ./frontend/logs:/app/frontend_logs:ro
     restart: unless-stopped
