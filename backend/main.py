@@ -76,7 +76,7 @@ from backend.config import (
     PARALLEL_WORKERS,
     PROCESSING_TIMEOUT_S,
 )
-from backend import log_viewer, transcript_viewer
+from backend import log_viewer, stats_viewer, transcript_viewer
 from backend.logging_config import log
 from backend.transcription.engine import AdaptiveEngine, get_model
 from backend.transcription.lang_guess import guess_language
@@ -125,6 +125,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="StreamScribe_adaptive backend", lifespan=lifespan)
 app.include_router(log_viewer.router)
 app.include_router(transcript_viewer.router)
+app.include_router(stats_viewer.router)
 
 
 @app.get("/health")
