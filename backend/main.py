@@ -203,6 +203,14 @@ async def _receiver(
     websocket: WebSocket, segmenter: VadSegmenter, queue: SegmentQueue, state: ConnectionState,
     send_lock: asyncio.Lock, engines: dict, sequencer: ResultSequencer,
 ) -> None:
+    """PLAIN-ENGLISH: this is the "listening" half of the connection. It
+    just loops forever reading whatever the frontend sends -- either raw
+    audio bytes (fed into the VAD segmenter, see vad_segmenter.py) or a
+    JSON control message (settings changes, pause/resume, Modal setup).
+    It deliberately does NOT do any of the slow work (transcribing,
+    translating) itself -- that's _processor()'s job, below. Keeping this
+    loop fast is what lets audio keep being captured smoothly even while a
+    slow segment is still being transcribed in the background."""
     was_speaking = False
 
     while True:
@@ -280,6 +288,16 @@ async def _processor(
     websocket: WebSocket, engines: dict, queue: SegmentQueue, state: ConnectionState,
     send_lock: asyncio.Lock, sequencer: ResultSequencer,
 ) -> None:
+    """PLAIN-ENGLISH: this is the "working" half of the connection. It
+    just loops forever, and each time around: takes the next segment off
+    the queue (waiting patiently if there's nothing to do yet -- see
+    SegmentQueue.pop), transcribes it, translates it, and sends the result
+    back to the frontend. See config.py's PARALLEL_WORKERS for how many of
+    these loops run at once -- more than one lets segments be worked on
+    simultaneously instead of strictly one-at-a-time.
+    The try/except below exists so that if any ONE segment fails for any
+    reason, this loop logs it and moves on to the next segment, instead of
+    the entire loop silently dying and never processing anything again."""
     while True:
         try:
             await _process_one_segment(websocket, engines, queue, state, send_lock, sequencer)
@@ -375,10 +393,23 @@ async def _sequencer_ticker(sequencer: ResultSequencer, state: ConnectionState, 
     even if no *other* segment happens to complete right after it stalls
     -- submit_result() alone only re-checks staleness when something new
     arrives to flush. Mirrors the frontend's own _check_delayed polling
-    (overlay_window.py, 250ms) in spirit."""
+    (overlay_window.py, 250ms) in spirit.
+
+    This is the ONLY thing that ever un-sticks a segment that's taking too
+    long once nothing else is arriving to trigger a flush -- if this loop
+    ever dies, every result queued up behind that one stuck segment is
+    stuck forever too (ResultSequencer only ever delivers in order), which
+    looks exactly like "the queue is stuck / stopped processing" from the
+    outside. Same fix as _processor below: never let one bad tick kill the
+    whole loop silently."""
     while True:
         await asyncio.sleep(0.2)
-        await sequencer.tick(state.acceptable_latency, websocket, send_lock)
+        try:
+            await sequencer.tick(state.acceptable_latency, websocket, send_lock)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Sequencer ticker hit an error -- continuing")
 
 
 @app.websocket("/ws/transcribe")

@@ -3,6 +3,23 @@ buffer, not a token stream, so "streaming" here means segment-and-
 transcribe-as-you-go: buffer speech frames, close a segment on trailing
 silence or a max-length cutoff, and emit periodic partial results on long
 segments so the overlay never looks frozen mid-sentence.
+
+PLAIN-ENGLISH OVERVIEW (for anyone new to this file):
+"VAD" = Voice Activity Detection -- a small library (webrtcvad) that looks
+at a tiny slice of audio (30 milliseconds) and answers one yes/no
+question: "is someone talking right now, or is this silence?" That's the
+ONLY thing it decides. This class calls VAD on every slice as audio comes
+in, 30ms at a time, and uses the answers to decide when one "utterance"
+(a sentence or phrase) has started and ended:
+  - speech starts -> start collecting frames into a buffer
+  - speech continues -> keep collecting, and every few seconds, send off
+    what's collected so far as a "partial" (a rough, in-progress guess,
+    so the caption on screen doesn't sit frozen mid-sentence)
+  - ~half a second of silence after speech -> the utterance is done,
+    send off everything collected as a "final" (the real, complete answer)
+This is what turns a never-ending stream of raw audio bytes into discrete
+chunks that the ASR model (faster-whisper etc.) can actually transcribe --
+those models expect one finished clip at a time, not an infinite stream.
 """
 
 from __future__ import annotations

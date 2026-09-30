@@ -62,21 +62,17 @@ QUEUE_LENGTH_DEMOTE_DEPTH = 2   # avg segments-ahead above this -> step down a t
 QUEUE_LENGTH_PROMOTE_DEPTH = 0  # avg segments-ahead at/below this -> try stepping back up
 QUEUE_STRAIN_WINDOW = 2
 
-# Adaptive parallelism: process up to this many segments concurrently
-# instead of strictly one at a time, so a burst of speech doesn't have to
-# wait for each prior segment to fully finish -- directly shrinks queue
-# backlog, on top of (not instead of) the tier-fallback and preemption
-# above. Sized from the CPU actually available: each worker gets its own
-# share of threads for its own single inference (faster-whisper's
-# `cpu_threads`), so total demand (workers * threads-per-worker) stays
-# inside what the machine actually has rather than oversubscribing it and
-# making every segment slower -- on a 2-core box this collapses back to
-# one worker using both threads, i.e. today's serialized behavior, since
-# splitting a machine that small into competing workers would only add
-# contention, not throughput. GPU (Modal) is unaffected -- Modal's own
-# container stays single-flight by design (see modal_engine.py's
+# How many segments the backend transcribes AT THE SAME TIME. 1 = fully
+# serial (today's setting): only ever one segment being worked on, next one
+# waits its turn -- simplest possible behavior, easiest to reason about
+# when debugging. Historically this was set automatically from CPU count
+# (2, 3, or 4 workers depending on the machine) so a burst of speech could
+# be processed in parallel instead of queueing up -- see git history for
+# that formula if higher throughput is wanted again later. Pinned back to
+# 1 for now to rule out concurrency as a source of bugs while diagnosing a
+# "queue gets stuck" report. GPU (Modal) is unaffected either way -- Modal's
+# own container stays single-flight by design (see modal_engine.py's
 # max_containers=1), a separate concern from local CPU parallelism.
-MAX_PARALLEL_WORKERS = 4
+PARALLEL_WORKERS = 1
 _cpu_count = os.cpu_count() or 2
-PARALLEL_WORKERS = max(1, min(_cpu_count // 2, MAX_PARALLEL_WORKERS))
 CPU_THREADS_PER_WORKER = max(1, _cpu_count // PARALLEL_WORKERS)
