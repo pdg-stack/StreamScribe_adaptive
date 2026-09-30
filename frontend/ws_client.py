@@ -12,6 +12,9 @@ import threading
 from collections.abc import Callable
 
 import websockets
+from websockets.exceptions import WebSocketException
+
+from .logging_config import log
 
 BACKEND_URI = "ws://127.0.0.1:8000/ws/transcribe"
 RECONNECT_DELAY_S = 2
@@ -86,7 +89,22 @@ class WsClient:
                     if self._on_connection_change:
                         self._on_connection_change(True)
                     await asyncio.gather(self._sender(ws), self._receiver(ws))
-            except (OSError, websockets.exceptions.WebSocketException):
+            except (OSError, WebSocketException) as exc:
+                log.info("WS connection lost/unavailable, retrying: %r", exc)
+                if self._on_connection_change:
+                    self._on_connection_change(False)
+                await asyncio.sleep(RECONNECT_DELAY_S)
+            except Exception:
+                # Anything else (a malformed event's json.JSONDecodeError,
+                # a bug in the on_event callback, ...) previously escaped
+                # uncaught here, all the way out of _run() -- for a
+                # background thread (not the main thread), Python's
+                # default handling just prints a traceback and lets the
+                # thread die silently, permanently ending all networking
+                # for the rest of the session with nothing but a stderr
+                # line that scrolls away. Logged and retried instead, the
+                # same as a plain connection failure.
+                log.exception("Unexpected error in WS connect loop, retrying")
                 if self._on_connection_change:
                     self._on_connection_change(False)
                 await asyncio.sleep(RECONNECT_DELAY_S)
@@ -103,4 +121,15 @@ class WsClient:
 
     async def _receiver(self, ws) -> None:
         async for message in ws:
-            self._on_event(json.loads(message))
+            try:
+                self._on_event(json.loads(message))
+            except Exception:
+                # Guards json.loads() and this call itself (on_event is
+                # bridge.event_received.emit -- a queued cross-thread Qt
+                # signal, so the connected slot, overlay.handle_event,
+                # actually runs later on the Qt thread; a bug *there*
+                # surfaces via sys.excepthook in main.py instead, not
+                # here). Either way, one bad message must not take down
+                # this receive loop and silently end all further event
+                # delivery for the rest of the connection.
+                log.exception("Error handling an incoming message: %.200r", message)

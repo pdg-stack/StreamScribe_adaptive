@@ -12,6 +12,8 @@ models_cache/
 # User data
 user_prefs.json
 *.log
+*.log.*
+logs/
 
 # Env
 .env
