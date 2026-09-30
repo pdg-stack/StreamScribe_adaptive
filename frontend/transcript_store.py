@@ -29,13 +29,15 @@ from pathlib import Path
 
 from .logging_config import log
 
-# Its own subdirectory, not directly under frontend/ -- docker-compose.yml
-# bind-mounts this directory (not the single .db file) read-only into the
-# backend container, mirroring the frontend/logs mount that already works
-# reliably: bind-mounting a single file that doesn't exist yet is a known
-# Docker gotcha (it silently creates a directory at that path instead),
-# and this file doesn't exist until the frontend runs for the first time.
-DB_DIR = Path(__file__).parent / "data"
+# Same folder frontend.log lives in (logging_config.py's LOG_DIR) -- every
+# log and the transcript history DB live under the repo's one top-level,
+# gitignored logs/ tree, not scattered under frontend/ separately.
+# docker-compose.yml bind-mounts this directory (not the single .db file)
+# read-only into the backend container: bind-mounting a single file that
+# doesn't exist yet is a known Docker gotcha (it silently creates a
+# directory at that path instead), and this file doesn't exist until the
+# frontend runs for the first time.
+DB_DIR = Path(__file__).parent.parent / "logs" / "frontend"
 DB_PATH = DB_DIR / "transcripts.db"
 
 _SCHEMA = """
