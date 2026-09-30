@@ -59,12 +59,14 @@ from backend.config import (
     DEFAULT_ENGINE,
     DEFAULT_TIER_MODE,
     MODEL_TIERS,
+    PARAKEET_LANGUAGES,
     PARALLEL_WORKERS,
     PROCESSING_TIMEOUT_S,
 )
 from backend import log_viewer
 from backend.logging_config import log
 from backend.transcription.engine import AdaptiveEngine, get_model
+from backend.transcription.lang_guess import guess_language
 from backend.transcription.modal_engine import ModalEngine
 from backend.transcription.parakeet_engine import ParakeetEngine
 from backend.transcription.result_sequencer import ResultSequencer
@@ -377,8 +379,22 @@ async def _process_one_segment(
         _truncate(result.text),
     )
 
+    # Parakeet never reports what language it transcribed (result.detected_lang
+    # is always None there -- see parakeet_engine.py). Left as None,
+    # translate()'s src->NLLB-code resolution silently falls back to "eng_Latn",
+    # which either skips translation outright (destination also English --
+    # looked fine, wasn't) or translates FROM the wrong assumed source
+    # language for anything else (garbage output, no error). Guessing from
+    # the text itself, restricted to Parakeet's 5 known-supported languages,
+    # fixes both -- and doubles as the detected_lang the frontend needs to
+    # decide whether to show a second "original language" line at all.
+    detected_lang = result.detected_lang
+    if not detected_lang:
+        candidates = PARAKEET_LANGUAGES if state.engine_name == "parakeet" else None
+        detected_lang = guess_language(result.text, candidates)
+
     translated = await asyncio.wait_for(
-        asyncio.to_thread(translate, result.text, result.detected_lang, state.dst_lang),
+        asyncio.to_thread(translate, result.text, detected_lang, state.dst_lang),
         timeout=PROCESSING_TIMEOUT_S,
     )
 
@@ -391,7 +407,7 @@ async def _process_one_segment(
     message = {
         "type": item.event.kind,
         "text": result.text,
-        "detected_lang": result.detected_lang,
+        "detected_lang": detected_lang,
         "translated_text": translated,
         "model_tier": result.model_tier,
         "cpu_status": result.cpu_status,
