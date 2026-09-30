@@ -37,6 +37,18 @@ from .ws_client import WsClient
 
 SOURCE_POLL_MS = 1000
 SINGLETON_KEY = "StreamScribe_adaptive_singleton"
+# PortAudio's capture callback (audio_capture.py) fires continuously every
+# ~20-60ms as long as the stream is alive, silence included -- it's driven
+# by the sound hardware finishing a buffer, not by anyone actually
+# speaking. So going several seconds with zero callbacks is a strong,
+# direct signal that capture itself has stalled, as opposed to "nobody's
+# spoken in a while," which looks completely different (callbacks keep
+# firing, the VAD just doesn't see speech in any of them). Checked every
+# CAPTURE_WATCHDOG_INTERVAL_MS; a gap past CAPTURE_STALL_THRESHOLD_S logs a
+# warning so a future "it just stopped working" report has hard evidence
+# either way instead of only a guess.
+CAPTURE_WATCHDOG_INTERVAL_MS = 5000
+CAPTURE_STALL_THRESHOLD_S = 3.0
 
 
 def _log_uncaught_exception(exc_type, exc_value, exc_tb) -> None:
@@ -166,6 +178,24 @@ def main() -> None:
     source_timer = QTimer()
     source_timer.timeout.connect(lambda: overlay.set_source_app(active_source_process()))
     source_timer.start(SOURCE_POLL_MS)
+
+    # See CAPTURE_STALL_THRESHOLD_S above -- `stalled` remembers whether
+    # we've already warned about the CURRENT gap, so a long stall logs
+    # once (not every 5s) and a recovery gets its own log line too.
+    capture_watchdog_state = type("CaptureWatchdogState", (), {"stalled": False})()
+
+    def on_capture_watchdog() -> None:
+        gap = capture.seconds_since_last_callback()
+        if gap > CAPTURE_STALL_THRESHOLD_S and not capture_watchdog_state.stalled:
+            capture_watchdog_state.stalled = True
+            log.warning("Audio capture callback hasn't fired in %.1fs -- capture may have stalled", gap)
+        elif gap <= CAPTURE_STALL_THRESHOLD_S and capture_watchdog_state.stalled:
+            capture_watchdog_state.stalled = False
+            log.info("Audio capture callback resumed firing normally")
+
+    capture_watchdog = QTimer()
+    capture_watchdog.timeout.connect(on_capture_watchdog)
+    capture_watchdog.start(CAPTURE_WATCHDOG_INTERVAL_MS)
 
     def on_app_quit() -> None:
         log.info("[App] StreamScribe_adaptive closing...")

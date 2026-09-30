@@ -20,6 +20,7 @@ function -- there's no separate loop you need to go looking for.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from math import gcd
 
@@ -56,6 +57,19 @@ class LoopbackCapture:
         self._pa = pyaudio.PyAudio()
         self._stream = None
         self.device: dict | None = None
+        # Set on EVERY callback invocation, whether or not there's actual
+        # sound -- PortAudio calls this continuously (every ~30-60ms) for
+        # as long as the stream is alive, silence included, since it's
+        # driven by the audio hardware finishing a buffer, not by anyone
+        # speaking. That makes this the one clean way to tell "genuinely
+        # nobody is talking right now" (callbacks keep firing, VAD just
+        # finds no speech in them) apart from "capture itself silently
+        # stalled" (callbacks stop firing entirely) -- see
+        # seconds_since_last_callback() below, used by main.py's watchdog.
+        self._last_callback_at = time.monotonic()
+
+    def seconds_since_last_callback(self) -> float:
+        return time.monotonic() - self._last_callback_at
 
     def default_loopback_device(self) -> dict:
         """The loopback counterpart of the current default output device --
@@ -96,6 +110,7 @@ class LoopbackCapture:
             # protection. Every branch below must stay inside this try/except
             # and keep returning paContinue, or one bad frame permanently
             # kills audio input until the app is restarted.
+            self._last_callback_at = time.monotonic()
             try:
                 if status:
                     log.warning("PortAudio callback status flag: %r", status)
