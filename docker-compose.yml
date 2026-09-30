@@ -7,4 +7,5 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - D:/Work/Docker/shared-model-cache:/root/.cache
+      - ./logs/backend:/app/logs
     restart: unless-stopped

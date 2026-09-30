@@ -47,7 +47,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-import traceback
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket
@@ -61,6 +61,7 @@ from backend.config import (
     MODEL_TIERS,
     PARALLEL_WORKERS,
 )
+from backend.logging_config import log
 from backend.transcription.engine import AdaptiveEngine, get_model
 from backend.transcription.modal_engine import ModalEngine
 from backend.transcription.parakeet_engine import ParakeetEngine
@@ -83,15 +84,14 @@ async def lifespan(app: FastAPI):
     # "ready" signal, and it hides multi-minute first-run model downloads
     # behind what looks like an already-running app. Parakeet/Modal are
     # deliberately left lazy: they're opt-in, not the default path.
-    print(
-        f"Adaptive parallelism: {PARALLEL_WORKERS} concurrent worker(s), "
-        f"{CPU_THREADS_PER_WORKER} CPU thread(s) each.",
-        flush=True,
+    log.info(
+        "Adaptive parallelism: %d concurrent worker(s), %d CPU thread(s) each.",
+        PARALLEL_WORKERS, CPU_THREADS_PER_WORKER,
     )
-    print("Warming up default models (faster-whisper small, NLLB-200 translator)...", flush=True)
+    log.info("Warming up default models (faster-whisper small, NLLB-200 translator)...")
     await asyncio.to_thread(get_model, MODEL_TIERS[0])
     await asyncio.to_thread(translator_module._load)
-    print("Models ready -- backend is fully warmed up.", flush=True)
+    log.info("Models ready -- backend is fully warmed up.")
     yield
 
 
@@ -152,11 +152,11 @@ async def _handle_modal_setup(
         state.engine_name = "modal"
         asyncio.create_task(_modal_heartbeat(websocket, engines, state, send_lock))
     except Exception as exc:
-        # Full traceback here (Docker logs), a concise message to the
-        # frontend -- silently reverting to "terminated" with no detail at
-        # all was the actual bug report ("modal instance setup is
-        # failing"): the failure was real but invisible, on both ends.
-        print(f"[Modal] setup failed:\n{traceback.format_exc()}", flush=True)
+        # Full traceback in the log, a concise message to the frontend --
+        # silently reverting to "terminated" with no detail at all was the
+        # actual bug report ("modal instance setup is failing"): the
+        # failure was real but invisible, on both ends.
+        log.exception("[Modal] setup failed")
         error_text = str(exc) or type(exc).__name__  # some exceptions str() to ""
         await _send_modal_status(websocket, send_lock, "terminated", error=error_text)
 
@@ -220,14 +220,17 @@ async def _receiver(
             for event in segmenter.push(message["bytes"]):
                 queue.push(event)
                 was_speaking = True
+                log.info("Segment queued: seq=%d kind=%s queue_len=%d", queue.next_seq - 1, event.kind, len(queue))
 
             if was_speaking and not segmenter.in_speech:
+                log.info("Speech -> silence, sending idle")
                 await _send_idle(websocket, engines, state, queue, sequencer, send_lock)
                 was_speaking = False
 
         elif message.get("text") is not None:
             control = json.loads(message["text"])
             control_type = control.get("type")
+            log.info("Control message: %s", control)
             if control_type == "set_dst_lang":
                 state.dst_lang = control.get("lang", state.dst_lang)
             elif control_type == "set_src_lang":
@@ -256,7 +259,10 @@ async def _receiver(
                     # in_speech stuck True and this connection would never
                     # emit another idle transition, stalling the frontend's
                     # queue/status light with nothing left to unstick them.
-                    for event in segmenter.force_close():
+                    closed = segmenter.force_close()
+                    if closed:
+                        log.info("Paused mid-speech -- force-closing %d buffered segment(s)", len(closed))
+                    for event in closed:
                         queue.push(event)
                         was_speaking = True
                     if was_speaking:
@@ -264,58 +270,102 @@ async def _receiver(
                         was_speaking = False
 
 
+def _truncate(text: str, limit: int = 80) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 async def _processor(
     websocket: WebSocket, engines: dict, queue: SegmentQueue, state: ConnectionState,
     send_lock: asyncio.Lock, sequencer: ResultSequencer,
 ) -> None:
     while True:
-        active_engine = engines[state.engine_name]
-        if isinstance(active_engine, AdaptiveEngine):
-            # Give tier fallback a chance to drain the backlog on its own
-            # before preempt_if_needed ever has to drop segments outright.
-            active_engine.record_queue_length(len(queue))
-        dropped_seqs = queue.preempt_if_needed(state.acceptable_latency)
-        if dropped_seqs:
-            # Those segments' audio is gone -- tell the sequencer now
-            # rather than letting it wait out the in-flight timeout for
-            # something that was never even submitted to a worker.
-            await sequencer.mark_abandoned(dropped_seqs, websocket, send_lock)
+        try:
+            await _process_one_segment(websocket, engines, queue, state, send_lock, sequencer)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A single bad segment (a model error, a translation failure,
+            # anything) must not permanently kill this worker -- before
+            # this fix, any exception here ended the whole while loop
+            # silently: the task just stops (nobody awaits or checks
+            # these background tasks), leaving the connection permanently
+            # short one worker for the rest of its life -- every worker
+            # hitting this early on would mean nothing ever gets
+            # transcribed again, with no error visible anywhere. The one
+            # segment that failed simply isn't delivered: mark_submitted
+            # was already called for it, so ResultSequencer's own
+            # in-flight timeout ages it out on its own, same as any other
+            # segment that's taking too long.
+            log.exception("Processor worker hit an error on one segment -- continuing")
+            # Guarantees this loop always yields back to the event loop on
+            # every iteration, even if the failure happened before
+            # _process_one_segment reached its first await (e.g. a bad
+            # engines[...] lookup) -- without an await somewhere in this
+            # branch, a failure that repeats with nothing ever awaiting
+            # first would spin this task as a tight synchronous loop and
+            # never yield, which starves every other task sharing this
+            # event loop (found by this exact scenario while testing the
+            # fix above, not theoretical). Also throttles a true failure
+            # storm instead of retrying as fast as physically possible.
+            await asyncio.sleep(0.2)
 
-        item = await queue.pop()
-        # This segment's "time of submission" for the sequencer's
-        # in-flight-too-long check below -- see result_sequencer.py.
-        sequencer.mark_submitted(item.seq)
-        # Re-resolved after the (possibly long) wait above, in case the
-        # engine was switched while the queue was empty -- matches the
-        # original pre-queue-length-tracking behavior.
-        engine = engines[state.engine_name]
 
-        start = time.monotonic()
-        result = await asyncio.to_thread(engine.transcribe_segment, item.event.audio, 16000, state.src_lang)
-        elapsed = time.monotonic() - start
-        queue.record_processing_time(elapsed)
+async def _process_one_segment(
+    websocket: WebSocket, engines: dict, queue: SegmentQueue, state: ConnectionState,
+    send_lock: asyncio.Lock, sequencer: ResultSequencer,
+) -> None:
+    active_engine = engines[state.engine_name]
+    if isinstance(active_engine, AdaptiveEngine):
+        # Give tier fallback a chance to drain the backlog on its own
+        # before preempt_if_needed ever has to drop segments outright.
+        active_engine.record_queue_length(len(queue))
+    dropped_seqs = queue.preempt_if_needed(state.acceptable_latency)
+    if dropped_seqs:
+        log.info("Preempted %d stale queued segment(s): seqs=%s", len(dropped_seqs), dropped_seqs)
+        # Those segments' audio is gone -- tell the sequencer now rather
+        # than letting it wait out the in-flight timeout for something
+        # that was never even submitted to a worker.
+        await sequencer.mark_abandoned(dropped_seqs, websocket, send_lock)
 
-        translated = await asyncio.to_thread(translate, result.text, result.detected_lang, state.dst_lang)
+    item = await queue.pop()
+    # This segment's "time of submission" for the sequencer's
+    # in-flight-too-long check below -- see result_sequencer.py.
+    sequencer.mark_submitted(item.seq)
+    # Re-resolved after the (possibly long) wait above, in case the
+    # engine was switched while the queue was empty -- matches the
+    # original pre-queue-length-tracking behavior.
+    engine = engines[state.engine_name]
 
-        # Built here (this segment's "time of completion"), but not sent
-        # directly: with PARALLEL_WORKERS > 1 several segments finish out
-        # of order (a fast worker on a short segment beats a slow worker
-        # still stuck on an earlier, longer one), so actually dispatching
-        # it -- in order, or skipping a segment that's taken too long --
-        # is ResultSequencer's job, not this loop's. See
-        # result_sequencer.py.
-        message = {
-            "type": item.event.kind,
-            "text": result.text,
-            "detected_lang": result.detected_lang,
-            "translated_text": translated,
-            "model_tier": result.model_tier,
-            "cpu_status": result.cpu_status,
-            "segment_closed_at": item.event.closed_at,
-            "queue_length": len(queue),
-            "workers": PARALLEL_WORKERS,
-        }
-        await sequencer.submit_result(item.seq, message, state.acceptable_latency, websocket, send_lock)
+    start = time.monotonic()
+    result = await asyncio.to_thread(engine.transcribe_segment, item.event.audio, 16000, state.src_lang)
+    elapsed = time.monotonic() - start
+    queue.record_processing_time(elapsed)
+    log.info(
+        "seq=%d kind=%s tier=%s cpu=%s elapsed=%.2fs queue_len=%d text=%r",
+        item.seq, item.event.kind, result.model_tier, result.cpu_status, elapsed, len(queue),
+        _truncate(result.text),
+    )
+
+    translated = await asyncio.to_thread(translate, result.text, result.detected_lang, state.dst_lang)
+
+    # Built here (this segment's "time of completion"), but not sent
+    # directly: with PARALLEL_WORKERS > 1 several segments finish out of
+    # order (a fast worker on a short segment beats a slow worker still
+    # stuck on an earlier, longer one), so actually dispatching it -- in
+    # order, or skipping a segment that's taken too long -- is
+    # ResultSequencer's job, not this loop's. See result_sequencer.py.
+    message = {
+        "type": item.event.kind,
+        "text": result.text,
+        "detected_lang": result.detected_lang,
+        "translated_text": translated,
+        "model_tier": result.model_tier,
+        "cpu_status": result.cpu_status,
+        "segment_closed_at": item.event.closed_at,
+        "queue_length": len(queue),
+        "workers": PARALLEL_WORKERS,
+    }
+    await sequencer.submit_result(item.seq, message, state.acceptable_latency, websocket, send_lock)
 
 
 async def _sequencer_ticker(sequencer: ResultSequencer, state: ConnectionState, websocket: WebSocket, send_lock: asyncio.Lock) -> None:
@@ -332,6 +382,8 @@ async def _sequencer_ticker(sequencer: ResultSequencer, state: ConnectionState, 
 @app.websocket("/ws/transcribe")
 async def ws_transcribe(websocket: WebSocket) -> None:
     await websocket.accept()
+    conn_id = uuid.uuid4().hex[:8]
+    log.info("[%s] connection open", conn_id)
 
     engines = {
         "faster-whisper": AdaptiveEngine(tier_mode=DEFAULT_TIER_MODE),
@@ -360,6 +412,8 @@ async def ws_transcribe(websocket: WebSocket) -> None:
 
     try:
         await receiver_task
+    except Exception:
+        log.exception("[%s] receiver task crashed", conn_id)
     finally:
         for task in processor_tasks:
             task.cancel()
@@ -368,3 +422,4 @@ async def ws_transcribe(websocket: WebSocket) -> None:
         # stop_modal (e.g. the app crashes or loses network), don't leave
         # a billed Modal container running past this session.
         engines["modal"].stop()
+        log.info("[%s] connection closed", conn_id)

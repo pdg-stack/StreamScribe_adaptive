@@ -23,6 +23,7 @@ import time
 from fastapi import WebSocket
 
 from backend.config import QUEUE_PREEMPTION_FACTOR
+from backend.logging_config import log
 
 
 class ResultSequencer:
@@ -70,6 +71,7 @@ class ResultSequencer:
                 # ever advances next_seq), and displaying it now would be
                 # exactly the out-of-order result this class exists to
                 # prevent.
+                log.info("Discarding late straggler result for seq=%d (next_seq=%d)", seq, self._next_seq)
                 return
             self._pending[seq] = message
             await self._flush(websocket, send_lock, acceptable_latency)
@@ -133,6 +135,10 @@ class ResultSequencer:
                 # seq that's already behind next_seq and is simply never
                 # picked up -- see submit_result, which never rewinds
                 # next_seq backwards.
+                log.info(
+                    "Skipping seq=%d: in flight %.2fs > %.2fs threshold",
+                    self._next_seq, time.monotonic() - submitted_at, QUEUE_PREEMPTION_FACTOR * acceptable_latency,
+                )
                 self._submitted_at.pop(self._next_seq, None)
                 self._next_seq += 1
                 continue
