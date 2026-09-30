@@ -8,8 +8,10 @@ services:
     volumes:
       - D:/Work/Docker/shared-model-cache:/root/.cache
       - ./logs/backend:/app/logs
-      - ./frontend/logs:/app/frontend_logs:ro
-      - ./frontend/data:/app/frontend_data:ro
+      # frontend.log and transcripts.db both live here now (see
+      # frontend/logging_config.py and frontend/transcript_store.py) --
+      # one read-only mount covers both.
+      - ./logs/frontend:/app/frontend_logs:ro
     restart: unless-stopped
 
   # Live container-log viewer (search, level highlighting, tail) for the
