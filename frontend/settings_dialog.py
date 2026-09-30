@@ -211,6 +211,16 @@ class SettingsDialog(QWidget):
         text_form.addRow("Text outline width", self.outline_width_spin)
         layout.addLayout(text_form)
 
+        self.show_source_toggle = self._add_toggle_row(
+            layout,
+            "Show original-language transcript",
+            s.show_source_transcript,
+            "show_source_transcript",
+            tooltip="When source and destination languages differ, shows the original-language "
+            "line (dimmer, smaller) under the translation. Off shows only the translation.\n"
+            "No effect when source and destination are the same -- there's only ever one line then.",
+        )
+
         window_label = QLabel("App window")
         window_label.setStyleSheet(SECTION_LABEL_STYLE)
         window_label.setToolTip("The floating overlay panel behind the caption text -- its background color and opacity.")
