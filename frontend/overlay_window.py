@@ -403,6 +403,19 @@ class OverlayWindow(QWidget):
             self._update_advanced_pane()
             return
 
+        if kind == "queue_update":
+            # A pure gauge broadcast (backend main.py's _sequencer_ticker,
+            # every 200ms) -- NOT evidence of real transcript activity, so
+            # this must not touch _last_result_at below: that would defeat
+            # _check_delayed's staleness detection, since this arrives
+            # continuously even while nothing is actually being
+            # transcribed. Its only job is keeping Queue/Threads accurate
+            # (e.g. after a preempted backlog or a model switch flushes
+            # the queue) without waiting for a transcript event that may
+            # not be coming for a while.
+            self._update_advanced_pane(queue_length=event.get("queue_length"), workers=event.get("workers"))
+            return
+
         # Any transcript-pipeline event -- partial, final, or idle -- is
         # evidence the pipeline is still responding; see _check_delayed().
         self._last_result_at = time.time()
