@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
 from .caption_icons import LineIconButton
 from .caption_view import CaptionView
 from .language_dropdown import LanguageDropdown
+from .logging_config import log
 from .settings import Settings
 from .settings_dialog import SettingsDialog
 
@@ -367,9 +368,9 @@ class OverlayWindow(QWidget):
             new_status = event.get("status", "terminated")
             error = event.get("error")
             if new_status != self.modal_status:
-                print(f"[Modal] status: {self.modal_status} -> {new_status}", flush=True)
+                log.info("[Modal] status: %s -> %s", self.modal_status, new_status)
             if error:
-                print(f"[Modal] setup failed: {error}", flush=True)
+                log.error("[Modal] setup failed: %s", error)
             self.modal_status = new_status
             if self._settings_panel is not None:
                 self._settings_panel.set_modal_status(self.modal_status, error)
@@ -395,9 +396,14 @@ class OverlayWindow(QWidget):
         self._set_status(event.get("cpu_status", "off"))
         new_tier = event.get("model_tier", "")
         if new_tier and new_tier != self._current_tier:
-            print(f"[Engine] model tier: {self._current_tier or '(none)'} -> {new_tier}", flush=True)
+            log.info("[Engine] model tier: %s -> %s", self._current_tier or "(none)", new_tier)
         self._current_tier = new_tier
         self._update_advanced_pane()
+        if kind in ("partial", "final"):
+            log.info(
+                "[Transcript] kind=%s cpu=%s tier=%s text_len=%d",
+                kind, event.get("cpu_status"), new_tier, len(event.get("text", "")),
+            )
 
         detected = event.get("detected_lang")
         if detected and self._is_auto_selected():

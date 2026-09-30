@@ -8,18 +8,47 @@ from the repo root.
 from __future__ import annotations
 
 import sys
+import threading
 
 from PyQt6.QtCore import QObject, QSharedMemory, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
 from .audio_capture import LoopbackCapture
 from .audio_source_detector import active_source_process
+from .logging_config import log
 from .overlay_window import OverlayWindow
 from .settings import Settings
 from .ws_client import WsClient
 
 SOURCE_POLL_MS = 1000
 SINGLETON_KEY = "StreamScribe_adaptive_singleton"
+
+
+def _log_uncaught_exception(exc_type, exc_value, exc_tb) -> None:
+    # The console window (and its scrollback) closes the instant the app
+    # exits, including on a crash -- an uncaught exception's traceback
+    # would otherwise only ever exist in that vanishing window, not the
+    # log file, since Python's default excepthook writes straight to
+    # stderr and nothing else.
+    log.critical("Uncaught exception -- app is about to exit", exc_info=(exc_type, exc_value, exc_tb))
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def _log_uncaught_thread_exception(args: threading.ExceptHookArgs) -> None:
+    # sys.excepthook only covers the main thread -- PortAudio's capture
+    # callback and ws_client's own connect-loop thread wrapper run on
+    # their own threads, where an uncaught exception would otherwise just
+    # print to stderr and silently end that thread (audio capture or all
+    # networking) for the rest of the session.
+    log.critical(
+        "Uncaught exception on thread %r", args.thread.name if args.thread else "?",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+    threading.__excepthook__(args)
+
+
+sys.excepthook = _log_uncaught_exception
+threading.excepthook = _log_uncaught_thread_exception
 
 
 class _EventBridge(QObject):
@@ -39,17 +68,17 @@ def main() -> None:
     # the segment up when that process exits, even if it crashes).
     singleton_guard = QSharedMemory(SINGLETON_KEY)
     if not singleton_guard.create(1):
-        print("StreamScribe_adaptive is already running -- close it first.")
+        log.warning("StreamScribe_adaptive is already running -- close it first.")
         sys.exit(1)
 
-    print("[App] StreamScribe_adaptive starting...", flush=True)
+    log.info("[App] StreamScribe_adaptive starting...")
 
     app = QApplication(sys.argv)
     settings = Settings.load()
     bridge = _EventBridge()
 
     def on_connection_change(connected: bool) -> None:
-        print(f"[Backend] {'connected' if connected else 'disconnected -- retrying...'}", flush=True)
+        log.info("[Backend] %s", "connected" if connected else "disconnected -- retrying...")
 
     ws_client = WsClient(on_event=bridge.event_received.emit, on_connection_change=on_connection_change)
 
@@ -60,19 +89,19 @@ def main() -> None:
         ws_client.set_dst_lang(code)
 
     def on_engine_change(engine: str) -> None:
-        print(f"[Engine] switched to: {engine}", flush=True)
+        log.info("[Engine] switched to: %s", engine)
         ws_client.set_engine(engine)
 
     def on_tier_change(tier: str) -> None:
-        print(f"[Engine] model size set to: {tier}", flush=True)
+        log.info("[Engine] model size set to: %s", tier)
         ws_client.set_tier(tier)
 
     def on_modal_setup_requested(token_id: str, token_secret: str) -> None:
-        print("[Modal] setup requested...", flush=True)
+        log.info("[Modal] setup requested...")
         ws_client.start_modal_setup(token_id, token_secret)
 
     def on_modal_stop_requested() -> None:
-        print("[Modal] stop requested...", flush=True)
+        log.info("[Modal] stop requested...")
         ws_client.stop_modal()
 
     # A single mutable attribute, read on PortAudio's own capture thread and
@@ -124,13 +153,13 @@ def main() -> None:
     source_timer.start(SOURCE_POLL_MS)
 
     def on_app_quit() -> None:
-        print("[App] StreamScribe_adaptive closing...", flush=True)
+        log.info("[App] StreamScribe_adaptive closing...")
 
     app.aboutToQuit.connect(on_app_quit)
     app.aboutToQuit.connect(capture.stop)
     app.aboutToQuit.connect(ws_client.stop)
 
-    print("[App] StreamScribe_adaptive started -- overlay is up, listening for system audio.", flush=True)
+    log.info("[App] StreamScribe_adaptive started -- overlay is up, listening for system audio.")
     sys.exit(app.exec())
 
 
