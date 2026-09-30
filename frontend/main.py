@@ -199,10 +199,17 @@ def main() -> None:
 
     def on_app_quit() -> None:
         log.info("[App] StreamScribe_adaptive closing...")
+        # Block briefly until the background WS thread has actually exited
+        # (not just been asked to). Without this, a message already in
+        # flight when stop() is called can still reach bridge.emit() after
+        # Qt has started tearing down _EventBridge/overlay, which surfaces
+        # as a cryptic "does not have a signal with the signature ..."
+        # AttributeError rather than a clean, safe no-op.
+        ws_client.stop()
+        ws_client.join(timeout=3.0)
 
     app.aboutToQuit.connect(on_app_quit)
     app.aboutToQuit.connect(capture.stop)
-    app.aboutToQuit.connect(ws_client.stop)
 
     log.info("[App] StreamScribe_adaptive started -- overlay is up, listening for system audio.")
     sys.exit(app.exec())

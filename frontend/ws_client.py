@@ -51,13 +51,38 @@ class WsClient:
         self._control_queue: queue.Queue[dict] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._current_ws = None
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
+        # Setting the flag alone isn't enough: _connect_loop only rechecks
+        # it once the current asyncio.gather(sender, receiver) call
+        # returns, which for the receiver means "the connection closed or
+        # errored" -- an open, idle connection can sit there indefinitely.
+        # Closing the live socket from here (via call_soon_threadsafe,
+        # since this runs on the Qt thread but the socket belongs to the
+        # background asyncio loop) makes _receiver's `async for` exit
+        # immediately, so the thread actually winds down instead of
+        # potentially outliving the Qt objects it delivers events to (see
+        # join() below and main.py's shutdown sequence).
         self._stop.set()
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._close_current_ws)
+
+    def _close_current_ws(self) -> None:
+        if self._current_ws is not None:
+            asyncio.ensure_future(self._current_ws.close())
+
+    def join(self, timeout: float | None = None) -> None:
+        """Blocks until the background thread has actually exited (or
+        `timeout` elapses). Call after stop(), before tearing down any Qt
+        object `on_event`/`on_connection_change` might still touch."""
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
 
     def send_audio(self, pcm_bytes: bytes) -> None:
         self._audio_queue.put(pcm_bytes)
@@ -94,6 +119,7 @@ class WsClient:
 
     def _run(self) -> None:
         loop = asyncio.new_event_loop()
+        self._loop = loop
         asyncio.set_event_loop(loop)
         loop.run_until_complete(self._connect_loop())
 
@@ -101,9 +127,13 @@ class WsClient:
         while not self._stop.is_set():
             try:
                 async with websockets.connect(BACKEND_URI) as ws:
+                    self._current_ws = ws
                     if self._on_connection_change:
                         self._on_connection_change(True)
-                    await asyncio.gather(self._sender(ws), self._receiver(ws))
+                    try:
+                        await asyncio.gather(self._sender(ws), self._receiver(ws))
+                    finally:
+                        self._current_ws = None
             except (OSError, WebSocketException) as exc:
                 log.info("WS connection lost/unavailable, retrying: %r", exc)
                 if self._on_connection_change:
