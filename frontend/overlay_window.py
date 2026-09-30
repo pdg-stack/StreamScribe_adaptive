@@ -570,6 +570,8 @@ class OverlayWindow(QWidget):
         same_lang = (bool(detected) and detected == dest_code) or raw_translated == raw_text
         if same_lang or not raw_translated:
             return [(raw_text, QColor(s.font_color), s.font_size, False)]
+        if not s.show_source_transcript:
+            return [(raw_translated, QColor(s.font_color), s.font_size, False)]
 
         dim = QColor(s.font_color)
         dim.setAlpha(150)
@@ -588,6 +590,8 @@ class OverlayWindow(QWidget):
         same_lang = (bool(detected) and detected == dest_code) or raw_translated == raw_text
         if same_lang or not raw_translated:
             return raw_text
+        if not self.settings.show_source_transcript:
+            return raw_translated
         return f"{raw_translated}\n{raw_text}"
 
     def _record_caption_event(self, kind: str, event: dict) -> None:

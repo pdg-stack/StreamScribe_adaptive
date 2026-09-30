@@ -58,6 +58,11 @@ class Settings:
     # sensitive once a token's been entered.
     modal_token_id: str = ""
     modal_token_secret: str = ""
+    # When source and destination languages differ, whether to show the
+    # original-language line at all (dimmer, smaller, under the
+    # translation) or just the translation alone. Irrelevant when source
+    # and destination are the same -- there's only ever one line then.
+    show_source_transcript: bool = True
 
     @classmethod
     def load(cls) -> "Settings":
