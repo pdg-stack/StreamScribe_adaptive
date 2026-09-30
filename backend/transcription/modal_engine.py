@@ -29,7 +29,7 @@ from typing import Callable
 
 import numpy as np
 
-from backend.config import BEAM_SIZE
+from backend.config import BEAM_SIZE, WHISPER_TEMPERATURE
 from backend.transcription.engine import TranscriptionResult
 
 MODEL_CACHE_DIR = "/cache/huggingface"
@@ -61,7 +61,9 @@ def _build_remote_cls(model_name: str):
         @modal.method()
         def transcribe(self, audio_bytes: bytes, sample_rate: int, language: str | None) -> dict:
             audio = np.frombuffer(audio_bytes, dtype=np.float32)
-            segments, info = self.model.transcribe(audio, language=language, beam_size=BEAM_SIZE)
+            segments, info = self.model.transcribe(
+                audio, language=language, beam_size=BEAM_SIZE, temperature=WHISPER_TEMPERATURE
+            )
             text = " ".join(s.text.strip() for s in segments).strip()
             return {"text": text, "detected_lang": info.language}
 
