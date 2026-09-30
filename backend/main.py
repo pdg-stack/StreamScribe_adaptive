@@ -33,8 +33,11 @@ more audio off the socket, and so backlog can be measured/preempted.
 Control messages in (JSON text frames):
     {"type": "set_dst_lang", "lang": "<iso-639-1>"}
     {"type": "set_src_lang", "lang": "auto"|"<iso-639-1>"}
-    {"type": "set_engine", "engine": "faster-whisper"|"parakeet"}  ("modal" is
-        entered via start_modal_setup below, not set_engine directly)
+    {"type": "set_engine", "engine": "faster-whisper"|"parakeet"|"modal"}  (a
+        first-time "modal" is entered via start_modal_setup below, not this --
+        set_engine only accepts "modal" as a pure routing change back to an
+        ALREADY-deployed instance, e.g. after switching to Local and back;
+        it's a no-op if nothing is actually deployed)
     {"type": "set_tier", "tier": "auto"|"small"|"base"|"tiny"}  (faster-whisper only)
     {"type": "set_acceptable_latency", "seconds": float}
     {"type": "start_modal_setup", "token_id": str, "token_secret": str}  (both
@@ -87,6 +90,16 @@ import backend.translation.translator as translator_module
 
 MODAL_HEARTBEAT_INTERVAL_S = 30
 
+# One ModalEngine for the whole process, NOT one per WebSocket connection --
+# only one Modal App/container is ever deployed at a time (max_containers=1
+# in modal_engine.py), so there's only ever one real "handle" to track. A
+# per-connection instance meant a mere reconnect (a network blip, the
+# frontend restarting) silently orphaned an actually-still-running Modal
+# container: a fresh ModalEngine() had is_active=False, so the frontend was
+# told "terminated" for something genuinely alive on Modal's side, and the
+# old container leaked with nothing left holding a reference to stop it.
+_modal_engine = ModalEngine()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -130,7 +143,10 @@ class ConnectionState:
         self.engine_name = DEFAULT_ENGINE
 
 
-async def _send_modal_status(websocket: WebSocket, send_lock: asyncio.Lock, status: str, error: str | None = None) -> None:
+async def _send_modal_status(websocket: WebSocket, send_lock: asyncio.Lock, status: str, error: str | None = None) -> bool:
+    """Returns whether the send actually succeeded -- callers that loop
+    (the heartbeat below) need to know when to give up rather than raising
+    past a closed/stale connection."""
     message = {
         "type": "modal_setup_status",
         "status": status,
@@ -138,20 +154,67 @@ async def _send_modal_status(websocket: WebSocket, send_lock: asyncio.Lock, stat
     }
     if error:
         message["error"] = error
-    async with send_lock:
-        await websocket.send_text(json.dumps(message))
+    try:
+        async with send_lock:
+            await websocket.send_text(json.dumps(message))
+        return True
+    except Exception:
+        return False
 
 
 async def _modal_heartbeat(websocket: WebSocket, engines: dict, state: ConnectionState, send_lock: asyncio.Lock) -> None:
-    """Runs for as long as this connection lives; only actually sends
-    anything while Modal is the active, live engine -- exits quietly once
-    it's been stopped or switched away from, rather than looping forever
-    doing nothing."""
+    """Runs for as long as the Modal engine is actually deployed --
+    independent of state.engine_name/routing, so switching to Local no
+    longer silently stops tracking (or orphans) an instance that's still
+    genuinely alive in the background. Each tick is a REAL round trip
+    (ModalEngine.ping), not a trust of local bookkeeping alone -- per
+    request: "always query modal and check what's the alive status", so a
+    container Modal itself scaled down or that crashed gets detected and
+    reported truthfully instead of this app continuing to claim "alive"
+    from stale state. Exits when the engine is stopped, or the first time
+    a send fails (this connection is gone -- a fresh one, if it comes,
+    starts its own heartbeat on connect; see ws_transcribe)."""
     modal_engine = engines["modal"]
-    while state.engine_name == "modal" and modal_engine.is_active:
+    while modal_engine.is_active:
         await asyncio.sleep(MODAL_HEARTBEAT_INTERVAL_S)
-        if state.engine_name == "modal" and modal_engine.is_active:
-            await _send_modal_status(websocket, send_lock, "alive")
+        if not modal_engine.is_active:
+            break
+        alive = await asyncio.to_thread(modal_engine.ping)
+        if not modal_engine.is_active:
+            break  # stopped while the ping was in flight
+        if alive:
+            if not await _send_modal_status(websocket, send_lock, "alive"):
+                break
+        else:
+            log.warning("[Modal] ping failed -- instance %s is no longer reachable, marking terminated", modal_engine.app_id)
+            modal_engine.stop()
+            if state.engine_name == "modal":
+                state.engine_name = DEFAULT_ENGINE
+            await _send_modal_status(websocket, send_lock, "terminated")
+            break
+
+
+async def _sync_modal_status_on_connect(
+    websocket: WebSocket, engines: dict, state: ConnectionState, send_lock: asyncio.Lock,
+) -> None:
+    """Called once, right after a connection opens (see ws_transcribe) --
+    the Modal engine is process-wide now (see _modal_engine above) and may
+    already be deployed from an earlier connection, so a fresh connection
+    must report the REAL current status immediately instead of leaving the
+    frontend at its own default ("terminated") until the next heartbeat
+    tick, up to MODAL_HEARTBEAT_INTERVAL_S away."""
+    modal_engine = engines["modal"]
+    if not modal_engine.is_active:
+        return
+    alive = await asyncio.to_thread(modal_engine.ping)
+    if alive:
+        log.info("[Modal] instance %s already deployed -- resuming heartbeat", modal_engine.app_id)
+        await _send_modal_status(websocket, send_lock, "alive")
+        asyncio.create_task(_modal_heartbeat(websocket, engines, state, send_lock))
+    else:
+        log.warning("[Modal] instance %s no longer reachable on reconnect -- marking terminated", modal_engine.app_id)
+        modal_engine.stop()
+        await _send_modal_status(websocket, send_lock, "terminated")
 
 
 async def _handle_modal_setup(
@@ -165,6 +228,7 @@ async def _handle_modal_setup(
 
     try:
         await asyncio.to_thread(engines["modal"].deploy_and_warm_up, on_status, token_id, token_secret)
+        log.info("[Modal] deployed, app_id=%s", engines["modal"].app_id)
         state.engine_name = "modal"
         asyncio.create_task(_modal_heartbeat(websocket, engines, state, send_lock))
     except Exception as exc:
@@ -181,10 +245,14 @@ async def _handle_modal_stop(websocket: WebSocket, engines: dict, state: Connect
     # Switch away from Modal immediately, before teardown even starts, so
     # the processor loop can never hand a segment to a ModalEngine that's
     # mid-stop() -- local is the fallback the instant this begins, not
-    # once teardown happens to finish.
+    # once teardown happens to finish. The ONLY path that actually tears
+    # down the Modal App/container -- switching the Local/Cloud radio no
+    # longer does (see set_engine's "modal" handling below), so an already-
+    # deployed instance survives being routed away from and back again.
     if state.engine_name == "modal":
         state.engine_name = DEFAULT_ENGINE
     await _send_modal_status(websocket, send_lock, "stopping")
+    log.info("[Modal] stopping instance %s", engines["modal"].app_id)
     # to_thread, not a direct blocking call: stop() tears down the Modal
     # App/container context (__exit__), which can take a moment -- run
     # inline here, it would stall the receiver loop (and so stall reading
@@ -303,6 +371,14 @@ async def _receiver(
                 requested = control.get("engine", DEFAULT_ENGINE)
                 if requested in ("faster-whisper", "parakeet"):
                     state.engine_name = requested
+                    await _flush_queue_on_model_change(queue, sequencer, websocket, send_lock)
+                elif requested == "modal" and engines["modal"].is_active:
+                    # Resuming routing to an already-deployed Modal
+                    # instance (e.g. switched to Local and back) -- purely
+                    # a routing change, same as the two branches above, not
+                    # a redeploy. See _handle_modal_setup for the one path
+                    # that actually deploys a new instance.
+                    state.engine_name = "modal"
                     await _flush_queue_on_model_change(queue, sequencer, websocket, send_lock)
             elif control_type == "start_modal_setup":
                 token_id = control.get("token_id") or None
@@ -509,7 +585,11 @@ async def ws_transcribe(websocket: WebSocket) -> None:
     engines = {
         "faster-whisper": AdaptiveEngine(tier_mode=DEFAULT_TIER_MODE),
         "parakeet": ParakeetEngine(),
-        "modal": ModalEngine(),
+        # The process-wide singleton (see its own comment above), not a
+        # fresh instance per connection -- this is what makes an already-
+        # deployed Modal instance survive a reconnect instead of being
+        # silently orphaned.
+        "modal": _modal_engine,
     }
     segmenter = VadSegmenter()
     queue = SegmentQueue()
@@ -518,6 +598,11 @@ async def ws_transcribe(websocket: WebSocket) -> None:
     # Restores in-order delivery across PARALLEL_WORKERS concurrent
     # workers -- see result_sequencer.py.
     sequencer = ResultSequencer()
+
+    # Reports the REAL current Modal status right away if an instance is
+    # already deployed from an earlier connection, and resumes its
+    # heartbeat under this connection -- see the function's own docstring.
+    await _sync_modal_status_on_connect(websocket, engines, state, send_lock)
 
     receiver_task = asyncio.create_task(_receiver(websocket, segmenter, queue, state, send_lock, engines, sequencer))
     # PARALLEL_WORKERS concurrent consumers of the same queue, not one --
@@ -539,8 +624,14 @@ async def ws_transcribe(websocket: WebSocket) -> None:
         for task in processor_tasks:
             task.cancel()
         ticker_task.cancel()
-        # Belt-and-suspenders: if the connection drops without an explicit
-        # stop_modal (e.g. the app crashes or loses network), don't leave
-        # a billed Modal container running past this session.
-        engines["modal"].stop()
+        # Deliberately NOT stopping the Modal engine here -- it's a
+        # process-wide singleton now (see _modal_engine above), and this
+        # connection closing is routine (a reconnect, the frontend
+        # restarting), not necessarily "the user is done." Tearing it down
+        # on every disconnect is exactly the bug this was fixed for: an
+        # instance that's still genuinely wanted would get destroyed and
+        # need a full, slow redeploy the moment anything reconnected.
+        # Modal's own scaledown_window (modal_engine.py) already idles out
+        # a truly-abandoned instance on its own; the explicit Stop button
+        # (main.py's stop_modal) is the only other intentional teardown.
         log.info("[%s] connection closed", conn_id)
