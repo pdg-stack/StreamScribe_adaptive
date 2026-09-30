@@ -99,6 +99,10 @@ _PAGE_HTML = """<!doctype html>
     padding: 6px 12px; font-size: 13px; cursor: pointer;
   }
   button:hover { background: #3a3a3a; }
+  nav.pages { display: flex; gap: 10px; font-size: 13px; }
+  nav.pages a { color: #999; text-decoration: none; }
+  nav.pages a.current { color: #fff; font-weight: 600; }
+  nav.pages a:hover { color: #fff; }
   #status { font-size: 12px; color: #888; margin-left: auto; }
   main { flex: 1; overflow: auto; padding: 0; }
   table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
@@ -119,6 +123,11 @@ _PAGE_HTML = """<!doctype html>
 <body>
 <header>
   <h1>Transcript History</h1>
+  <nav class="pages">
+    <a href="/logs">Logs</a>
+    <a class="current" href="/transcripts">Transcripts</a>
+    <a href="/stats">Stats</a>
+  </nav>
   <input type="text" id="filter" placeholder="Search text, language, model...">
   <label>Rows <select id="limitSelect">
     <option value="200">200</option>

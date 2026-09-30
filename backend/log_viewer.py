@@ -106,6 +106,10 @@ _PAGE_HTML = """<!doctype html>
   button:hover { background: #3a3a3a; }
   a.dl { color: #7fbfff; font-size: 13px; text-decoration: none; }
   a.dl:hover { text-decoration: underline; }
+  nav.pages { display: flex; gap: 10px; font-size: 13px; }
+  nav.pages a { color: #999; text-decoration: none; }
+  nav.pages a.current { color: #fff; font-weight: 600; }
+  nav.pages a:hover { color: #fff; }
   #status { font-size: 12px; color: #888; margin-left: auto; }
   main { flex: 1; overflow: auto; padding: 0; }
   pre {
@@ -121,6 +125,11 @@ _PAGE_HTML = """<!doctype html>
 <body>
 <header>
   <h1>StreamScribe_adaptive Logs</h1>
+  <nav class="pages">
+    <a class="current" href="/logs">Logs</a>
+    <a href="/transcripts">Transcripts</a>
+    <a href="/stats">Stats</a>
+  </nav>
   <div class="tabs">
     <div class="tab active" data-source="backend">Backend</div>
     <div class="tab" data-source="frontend">Frontend</div>
