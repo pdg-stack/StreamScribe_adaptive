@@ -516,13 +516,15 @@ class OverlayWindow(QWidget):
         self._toolbar_opacity.setOpacity(1.0 if header_shown else 0.0)
         self._toolbar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not header_shown)
 
-        # Advanced mode itself (not auto-hide) still reclaims the footer's
-        # space entirely when off -- that's a separate, existing toggle.
-        self._advanced_pane.setVisible(self.settings.advanced_mode)
-        if self.settings.advanced_mode:
-            footer_shown = self._is_hovering if self.settings.auto_hide_footer else True
-            self._footer_opacity.setOpacity(1.0 if footer_shown else 0.0)
-            self._advanced_pane.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not footer_shown)
+        # Same opacity-only approach for "Show advanced diagnostics" itself,
+        # not just its auto-hide -- setVisible(False) here used to reclaim
+        # the footer's layout slot entirely, which let the caption text
+        # area grow to fill the freed space the instant the toggle was
+        # switched off. auto_hide_footer only matters while advanced_mode
+        # is actually on; off, the footer stays hidden regardless of hover.
+        footer_shown = self.settings.advanced_mode and (self._is_hovering if self.settings.auto_hide_footer else True)
+        self._footer_opacity.setOpacity(1.0 if footer_shown else 0.0)
+        self._advanced_pane.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not footer_shown)
 
     def _update_advanced_pane(self, queue_length: int | None = None, workers: int | None = None) -> None:
         if queue_length is not None:
@@ -548,7 +550,11 @@ class OverlayWindow(QWidget):
         self.advanced_host_label.setText(f"Host: {host_text}")
         self.advanced_model_label.setText(f"Model: {self.settings.engine}")
         tier = self._current_tier or self.settings.tier
-        self.advanced_size_label.setText(f"Size: {tier}")
+        # Parakeet has exactly one checkpoint, no tiers (see
+        # parakeet_engine.py) -- its model_tier is always literally the
+        # string "parakeet", which just repeats "Model: parakeet" right
+        # next to it. Nothing meaningful to show there in that case.
+        self.advanced_size_label.setText(f"Size: {tier}" if tier != "parakeet" else "Size: —")
 
     def _entry_paragraphs(self, entry: dict) -> list[tuple[str, QColor, int, bool]]:
         """One caption entry -> one or two (text, color, font_size, italic)
