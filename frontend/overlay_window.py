@@ -51,6 +51,15 @@ LISTENING_TIMEOUT_MS = 5000
 # header/footer actually fading out -- see _update_hover_state().
 HIDE_DELAY_MS = 300
 
+# Safety-net poll interval for _update_hover_state -- see its own timer
+# setup in __init__ for why this exists: Qt's Enter/Leave delivery on a
+# frameless, always-on-top, click-through-toggling window like this one is
+# a known-flaky spot (confirmed as the cause of "header won't auto-hide,
+# intermittently" -- a single missed Leave event left _is_hovering stuck
+# True forever, since nothing else ever re-checked it). Cheap enough
+# (one QCursor.pos() + one rect containment test) to just always run.
+HOVER_POLL_MS = 500
+
 # How often _check_delayed polls for staleness, and the multiple of the
 # acceptable-latency setting past which a silent pipeline counts as
 # "delayed" -- mirrors the backend's own QUEUE_PREEMPTION_FACTOR (1.2), the
@@ -170,6 +179,14 @@ class OverlayWindow(QWidget):
         self._hide_delay_timer = QTimer(self)
         self._hide_delay_timer.setSingleShot(True)
         self._hide_delay_timer.timeout.connect(self._commit_hide)
+
+        # See HOVER_POLL_MS above -- event-driven Enter/Leave tracking alone
+        # can get permanently stuck if Qt ever fails to deliver one Leave
+        # event; this periodically re-derives the true state instead of
+        # trusting that every event arrives.
+        self._hover_poll_timer = QTimer(self)
+        self._hover_poll_timer.timeout.connect(self._update_hover_state)
+        self._hover_poll_timer.start(HOVER_POLL_MS)
 
         # See _check_delayed(): the backend doesn't expose a per-segment
         # "now waiting" signal (only the eventual result, if it isn't
