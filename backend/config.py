@@ -76,3 +76,16 @@ QUEUE_STRAIN_WINDOW = 2
 PARALLEL_WORKERS = 1
 _cpu_count = os.cpu_count() or 2
 CPU_THREADS_PER_WORKER = max(1, _cpu_count // PARALLEL_WORKERS)
+
+# Hard ceiling on how long a single segment's transcribe+translate call may
+# run before it's given up on. Confirmed via logs: with PARALLEL_WORKERS=1,
+# a single abnormally slow model.transcribe() call (e.g. the machine's CPU
+# was under heavy contention from something else entirely -- another
+# process competing for the same cores will do this) can leave the ONE
+# worker permanently stuck waiting on it, since nothing else exists to pick
+# up new segments in the meantime -- the queue then only ever grows,
+# forever, with no further transcript ever produced. This value is well
+# above every processing time actually observed in testing (worst case so
+# far ~9s) but still finite, so one pathologically slow call becomes "this
+# one segment is skipped" instead of "the entire pipeline is now dead."
+PROCESSING_TIMEOUT_S = 30.0

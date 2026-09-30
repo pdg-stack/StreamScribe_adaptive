@@ -60,6 +60,7 @@ from backend.config import (
     DEFAULT_TIER_MODE,
     MODEL_TIERS,
     PARALLEL_WORKERS,
+    PROCESSING_TIMEOUT_S,
 )
 from backend import log_viewer
 from backend.logging_config import log
@@ -357,7 +358,17 @@ async def _process_one_segment(
     engine = engines[state.engine_name]
 
     start = time.monotonic()
-    result = await asyncio.to_thread(engine.transcribe_segment, item.event.audio, 16000, state.src_lang)
+    # asyncio.wait_for can't actually kill the underlying OS thread (Python
+    # has no forced-thread-termination API) -- if transcribe_segment really
+    # is stuck, that thread keeps running orphaned in the background. What
+    # this DOES do is stop the ONE processor loop from waiting on it
+    # forever: on timeout, this raises, _processor's try/except (below)
+    # logs it and moves straight to the next segment instead of the whole
+    # pipeline going permanently silent behind one abnormally slow call.
+    result = await asyncio.wait_for(
+        asyncio.to_thread(engine.transcribe_segment, item.event.audio, 16000, state.src_lang),
+        timeout=PROCESSING_TIMEOUT_S,
+    )
     elapsed = time.monotonic() - start
     queue.record_processing_time(elapsed)
     log.info(
@@ -366,7 +377,10 @@ async def _process_one_segment(
         _truncate(result.text),
     )
 
-    translated = await asyncio.to_thread(translate, result.text, result.detected_lang, state.dst_lang)
+    translated = await asyncio.wait_for(
+        asyncio.to_thread(translate, result.text, result.detected_lang, state.dst_lang),
+        timeout=PROCESSING_TIMEOUT_S,
+    )
 
     # Built here (this segment's "time of completion"), but not sent
     # directly: with PARALLEL_WORKERS > 1 several segments finish out of
