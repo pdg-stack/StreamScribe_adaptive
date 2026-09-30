@@ -34,6 +34,7 @@ from .language_dropdown import LanguageDropdown
 from .logging_config import log
 from .settings import Settings
 from .settings_dialog import SettingsDialog
+from .transcript_store import TranscriptStore
 
 STRAIN_COLORS = {
     "off": "#555555",
@@ -56,6 +57,12 @@ HIDE_DELAY_MS = 300
 # same threshold at which the backend itself starts dropping stale backlog.
 DELAYED_CHECK_INTERVAL_MS = 250
 DELAYED_FACTOR = 1.2
+
+# How long a finalized entry (or a <delayed> marker) waits before actually
+# being written to the transcript history DB -- see transcript_store.py's
+# docstring for why this is a deliberate settle margin, not a wait for
+# more text.
+TRANSCRIPT_STORE_DEBOUNCE_MS = 1500
 
 # ISO 639-1 codes for faster-whisper's source AND destination pickers (both
 # filtered identically by the active engine -- see _source_languages_for_
@@ -136,6 +143,25 @@ class OverlayWindow(QWidget):
         self._current_partial_entry: dict | None = None
         self._drag_offset: QPoint | None = None
         self._is_hovering = False
+
+        # When the current in-progress utterance's first partial arrived --
+        # its "start" time for the transcript-history DB, since no single
+        # backend event ever carries the segment's true start, only when it
+        # closed (see _record_caption_event). None between utterances.
+        self._pending_utterance_started_at: float | None = None
+        # Whether a <delayed> streak is currently active, independent of
+        # persist_subtitles -- used only to dedupe transcript-history DB
+        # writes to one row per continuous delayed streak (see
+        # _show_delayed_marker), separate from that on-screen dedup check.
+        self._delayed_marker_active = False
+        try:
+            self._transcript_store: TranscriptStore | None = TranscriptStore()
+        except Exception:
+            # A history DB the app can't open (disk full, permissions,
+            # anything) must never block live transcription -- log it once
+            # and just skip persistence for the session instead.
+            log.exception("Could not open transcript history DB -- history won't be recorded this session")
+            self._transcript_store = None
 
         self._listening_timer = QTimer(self)
         self._listening_timer.setSingleShot(True)
@@ -448,6 +474,7 @@ class OverlayWindow(QWidget):
 
     def _show_delayed_marker(self) -> None:
         already_delayed = bool(self._caption_entries) and self._caption_entries[-1].get("marker") == "delayed"
+        is_new_delayed_streak = not self._delayed_marker_active
         if self.settings.persist_subtitles:
             # Repeated delayed detections describe the same ongoing gap,
             # not a new one each time -- don't pile up a fresh <delayed>
@@ -457,6 +484,16 @@ class OverlayWindow(QWidget):
         else:
             self._caption_entries = [{"marker": "delayed"}]
         self._current_partial_entry = None
+        self._pending_utterance_started_at = None
+        if is_new_delayed_streak:
+            self._delayed_marker_active = True
+            now = time.time()
+            self._queue_transcript_row(
+                is_delayed=True, start_ts=now, end_ts=now,
+                source_text="<delayed>", dest_text="<delayed>",
+                source_lang=None, dest_lang=self.dest_combo.currentData(),
+                auto_detect=self._is_auto_selected(),
+            )
         self._render_caption_view()
 
     def apply_settings(self, settings: Settings) -> None:
@@ -526,6 +563,20 @@ class OverlayWindow(QWidget):
         self._footer_opacity.setOpacity(1.0 if footer_shown else 0.0)
         self._advanced_pane.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not footer_shown)
 
+    def _current_host_text(self) -> str:
+        # Visible even with the settings panel closed -- local is the
+        # actual fallback the whole time Modal isn't "ready"/"alive" (see
+        # backend/main.py: engine_name only ever becomes "modal" once
+        # deploy_and_warm_up() succeeds), so this always reflects which
+        # engine is *actually* running, not just what was requested.
+        return {
+            "deploying": "Cloud (starting…)",
+            "warming up": "Cloud (warming up…)",
+            "stopping": "Cloud (stopping…)",
+            "ready": "Cloud (Modal)",
+            "alive": "Cloud (Modal)",
+        }.get(self.modal_status, "Local")
+
     def _update_advanced_pane(self, queue_length: int | None = None, workers: int | None = None) -> None:
         if queue_length is not None:
             self._last_queue_length = queue_length
@@ -535,19 +586,7 @@ class OverlayWindow(QWidget):
         self.advanced_threads_label.setText(f"Threads: {self._last_worker_count if self._last_worker_count is not None else '—'}")
         self.advanced_delay_label.setText(f"Delay: {self.settings.acceptable_latency_s:g}s")
         self.advanced_app_label.setText(f"Source: {self._current_source_app or '—'}")
-        # Visible even with the settings panel closed -- local is the
-        # actual fallback the whole time Modal isn't "ready"/"alive" (see
-        # backend/main.py: engine_name only ever becomes "modal" once
-        # deploy_and_warm_up() succeeds), so this always reflects which
-        # engine is *actually* running, not just what was requested.
-        host_text = {
-            "deploying": "Cloud (starting…)",
-            "warming up": "Cloud (warming up…)",
-            "stopping": "Cloud (stopping…)",
-            "ready": "Cloud (Modal)",
-            "alive": "Cloud (Modal)",
-        }.get(self.modal_status, "Local")
-        self.advanced_host_label.setText(f"Host: {host_text}")
+        self.advanced_host_label.setText(f"Host: {self._current_host_text()}")
         self.advanced_model_label.setText(f"Model: {self.settings.engine}")
         tier = self._current_tier or self.settings.tier
         # Parakeet has exactly one checkpoint, no tiers (see
@@ -611,17 +650,68 @@ class OverlayWindow(QWidget):
             # even after the user later changes the destination picker.
             "dest_code": self.dest_combo.currentData(),
         }
+        # A real event ending -- any delayed streak is over.
+        self._delayed_marker_active = False
         if kind == "final":
             if self.settings.persist_subtitles:
                 self._caption_entries.append(entry)
             else:
                 self._caption_entries = [entry]
             self._current_partial_entry = None
+            # "final" is genuinely finished per the backend's own
+            # segmentation contract (vad_segmenter.py) -- no further
+            # partial will ever refine this one -- so this is exactly the
+            # point to persist it. start_ts falls back to now for the rare
+            # case a "final" arrives with no partial ever seen before it
+            # (a very short utterance); end_ts prefers the backend's own
+            # segment_closed_at over local receipt time.
+            start_ts = self._pending_utterance_started_at or time.time()
+            end_ts = event.get("segment_closed_at") or time.time()
+            self._pending_utterance_started_at = None
+            source_lang = entry["detected_lang"] or (
+                None if self._is_auto_selected() else self.source_combo.currentData()
+            )
+            self._queue_transcript_row(
+                is_delayed=False, start_ts=start_ts, end_ts=end_ts,
+                source_text=entry["text"], dest_text=entry["translated_text"],
+                source_lang=source_lang, dest_lang=entry["dest_code"],
+                auto_detect=self._is_auto_selected(),
+            )
         else:  # partial
+            if self._current_partial_entry is None:
+                # First partial of a new utterance -- its start time, since
+                # no backend event ever reports a segment's true start,
+                # only when it closed.
+                self._pending_utterance_started_at = time.time()
             self._current_partial_entry = entry
             if not self.settings.persist_subtitles:
                 self._caption_entries = []
         self._render_caption_view()
+
+    def _queue_transcript_row(
+        self, *, is_delayed: bool, start_ts: float, end_ts: float, source_text: str, dest_text: str,
+        source_lang: str | None, dest_lang: str | None, auto_detect: bool,
+    ) -> None:
+        """Schedules a debounced (TRANSCRIPT_STORE_DEBOUNCE_MS) write to the
+        transcript history DB -- see transcript_store.py for why this is
+        delayed rather than immediate. Everything is snapshotted into the
+        closure now, at the moment the entry became final/delayed, not
+        re-read from live state when the timer actually fires."""
+        if self._transcript_store is None:
+            return
+        store = self._transcript_store
+        host = self._current_host_text()
+        model = self.settings.engine
+        size = self._current_tier or self.settings.tier
+        source_app = self._current_source_app
+        QTimer.singleShot(
+            TRANSCRIPT_STORE_DEBOUNCE_MS,
+            lambda: store.insert(
+                start_ts=start_ts, end_ts=end_ts, is_delayed=is_delayed, auto_detect=auto_detect,
+                source_lang=source_lang, dest_lang=dest_lang, source_text=source_text, dest_text=dest_text,
+                host=host, model=model, size=size, source_app=source_app,
+            ),
+        )
 
     def _font_background_color(self) -> QColor | None:
         """None means no box at all -- either by the color's own alpha or
