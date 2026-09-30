@@ -1,6 +1,21 @@
 """WebSocket client: streams captured PCM to the backend and delivers
 parsed transcript/translation/status JSON events back via callback.
 Reconnects automatically if the backend isn't running yet or drops.
+
+PLAIN-ENGLISH OVERVIEW (for anyone new to this file):
+A "WebSocket" is just a two-way, always-open network connection -- unlike
+a normal web request (ask once, get one answer, done), it stays open so
+either side can send messages to the other at any time. This class owns
+that connection to the backend running in Docker. It runs on its own
+background thread (see start()) so that sending/receiving over the network
+never freezes the app's window -- Qt (the UI toolkit this app's window is
+built with) needs its own thread free at all times to stay responsive.
+Two small queues (see __init__) are how the rest of the app hands things
+to this background thread safely: audio bytes go in `_audio_queue`,
+settings/control changes go in `_control_queue`. _connect_loop() below is
+the main loop: connect, then run sending and receiving at the same time
+until something goes wrong, then wait a couple seconds and try again --
+forever, for as long as the app is open.
 """
 
 from __future__ import annotations
