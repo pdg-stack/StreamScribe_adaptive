@@ -3,6 +3,21 @@ overlay UI. Runs natively on Windows, outside Docker -- Docker can't reach
 host audio devices or the desktop compositor, so this process must run
 directly on the host (see README/plan). Run as `python -m frontend.main`
 from the repo root.
+
+PLAIN-ENGLISH OVERVIEW (for anyone new to this file):
+This is the file that starts the whole app and connects its three main
+pieces together, like plugging cables between them:
+  1. `capture` (audio_capture.py) grabs audio straight from Windows.
+  2. `ws_client` (ws_client.py) sends that audio to the backend over the
+     network and receives back the transcribed/translated text.
+  3. `overlay` (overlay_window.py) is the actual floating window you see
+     on screen, showing that text.
+The small `on_*` functions in main() below (on_audio_captured,
+on_audio_activity, etc.) are the "cables" -- each one just takes
+something that happened in one piece and hands it to the next piece.
+Nothing complicated happens in this file itself; it just introduces the
+pieces to each other and then starts Qt's main loop (`app.exec()`), which
+is what actually keeps the window alive and responsive until you close it.
 """
 
 from __future__ import annotations

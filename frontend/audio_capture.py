@@ -2,6 +2,20 @@
 outputting (any app, not the microphone) and resamples to 16kHz mono
 int16 PCM for the backend. pyaudiowpatch was chosen over `soundcard` for
 its purpose-built, more battle-tested WASAPI loopback support (see plan).
+
+PLAIN-ENGLISH OVERVIEW (for anyone new to this file):
+"Loopback" capture means recording Windows' own audio OUTPUT (whatever
+you'd hear through your speakers/headphones) rather than a microphone
+INPUT -- that's how this app can caption a YouTube video or any other
+app's sound without needing you to speak into anything.
+The `callback` function inside start() below is the heart of this file:
+Windows calls it automatically, over and over, a little chunk of audio at
+a time (about 1024 samples each), for as long as the stream is running.
+Each time it's called, this code: converts that chunk to the format the
+backend expects (16kHz, mono, 16-bit), hands it off to be sent over the
+network, and does a quick "is this actually sound or just silence?" check
+to drive the on-screen status light. Everything happens inside that one
+function -- there's no separate loop you need to go looking for.
 """
 
 from __future__ import annotations
