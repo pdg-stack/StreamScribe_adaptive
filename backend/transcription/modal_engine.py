@@ -29,7 +29,7 @@ from typing import Callable
 
 import numpy as np
 
-from backend.config import BEAM_SIZE
+from backend.config import BEAM_SIZE, WHISPER_TEMPERATURE
 from backend.transcription.engine import TranscriptionResult
 
 MODEL_CACHE_DIR = "/cache/huggingface"
@@ -61,7 +61,9 @@ def _build_remote_cls(model_name: str):
         @modal.method()
         def transcribe(self, audio_bytes: bytes, sample_rate: int, language: str | None) -> dict:
             audio = np.frombuffer(audio_bytes, dtype=np.float32)
-            segments, info = self.model.transcribe(audio, language=language, beam_size=BEAM_SIZE)
+            segments, info = self.model.transcribe(
+                audio, language=language, beam_size=BEAM_SIZE, temperature=WHISPER_TEMPERATURE
+            )
             text = " ".join(s.text.strip() for s in segments).strip()
             return {"text": text, "detected_lang": info.language}
 
@@ -69,12 +71,19 @@ def _build_remote_cls(model_name: str):
 
 
 class ModalEngine:
-    """One instance per WebSocket connection, but Modal state (the App/
-    container) only exists between deploy_and_warm_up() and stop() --
-    calling transcribe_segment() before deploy_and_warm_up() (or after
-    stop()) is a caller error, not something this class silently handles,
-    since main.py only reaches it while state.engine_name == "modal" and
-    the frontend only offers Modal after setup reports "ready"."""
+    """A process-wide singleton (see main.py's _get_modal_engine), NOT one
+    instance per WebSocket connection -- a websocket reconnect (a network
+    blip, the frontend restarting) must not lose track of an already-live
+    Modal container. Since only one App/container is ever deployed at a
+    time (max_containers=1), there's only ever one real "handle" to keep
+    track of regardless of how many frontend connections come and go.
+
+    Modal state (the App/container) only exists between
+    deploy_and_warm_up() and stop() -- calling transcribe_segment() before
+    deploy_and_warm_up() (or after stop()) is a caller error, not
+    something this class silently handles, since main.py only reaches it
+    while state.engine_name == "modal" and the frontend only offers Modal
+    after setup reports "ready"."""
 
     def __init__(self, model_name: str = DEFAULT_MODAL_TIER, gpu: str = DEFAULT_GPU) -> None:
         self.model_name = model_name
@@ -82,6 +91,12 @@ class ModalEngine:
         self._app = None
         self._run_ctx = None
         self._instance = None
+        # The "handle" main.py's modal_setup_status events surface, and
+        # what gets logged -- Modal's own identifier for this App run, so
+        # there's a concrete answer to "which deployment is this" instead
+        # of just an in-memory Python object no one outside this process
+        # can inspect. None whenever no App is currently deployed.
+        self.app_id: str | None = None
         self._rtf_samples: list[float] = []
         # See AdaptiveEngine._state_lock: transcribe_segment() runs inside
         # asyncio.to_thread, and backend/main.py's PARALLEL_WORKERS can put
@@ -142,11 +157,31 @@ class ModalEngine:
 
         self._run_ctx = self._app.run()
         self._run_ctx.__enter__()
+        # The concrete identifier for this deployment -- see app_id's own
+        # comment on why this is recorded at all, rather than just holding
+        # onto the (opaque, in-process-only) App object.
+        self.app_id = self._app.app_id
 
         on_status("warming up")
         call = self._instance.ping.spawn()
         call.get(timeout=180)
         on_status("ready")
+
+    def ping(self, timeout: float = 30.0) -> bool:
+        """A real round trip to the actual deployed container, not just a
+        check of this process's own believe-it's-active bookkeeping (see
+        is_active) -- confirms Modal hasn't scaled it down or otherwise
+        ended it out from under us. Used by main.py's heartbeat to report
+        genuine "alive" status rather than an assumed one. False (never
+        raises) for anything that means this instance is no longer usable:
+        no deployment at all, the call failing, or timing out."""
+        if not self.is_active:
+            return False
+        try:
+            call = self._instance.ping.spawn()
+            return bool(call.get(timeout=timeout))
+        except Exception:
+            return False
 
     def stop(self) -> None:
         if self._run_ctx is not None:
@@ -154,6 +189,7 @@ class ModalEngine:
             self._run_ctx = None
         self._app = None
         self._instance = None
+        self.app_id = None
 
     def transcribe_segment(
         self, audio: np.ndarray, sample_rate: int = 16000, language: str | None = None

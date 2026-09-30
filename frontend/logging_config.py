@@ -2,8 +2,12 @@
 window launch.bat opens is closed (and its scrollback lost) the instant
 the app exits or the window is closed, so nothing printed there survives
 past that session. Every log record also goes to a rotating file under
-frontend/logs/, next to this app, so a session's behavior can be
+the repo's top-level logs/ folder, so a session's behavior can be
 inspected after the fact instead of only while the console is still open.
+
+Everything under logs/ -- this file, the backend's own log, and the
+transcript history DB (transcript_store.py) -- lives in that one
+gitignored tree, not scattered under frontend/ and backend/ separately.
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR = Path(__file__).parent.parent / "logs" / "frontend"
 LOG_FILE = LOG_DIR / "frontend.log"
 MAX_BYTES = 5 * 1024 * 1024
 BACKUP_COUNT = 3
