@@ -8,10 +8,13 @@ true per-app audio isolation.
 
 from __future__ import annotations
 
+import os
+
 import win32api
 from pycaw.pycaw import AudioUtilities, IAudioMeterInformation
 
 _PEAK_THRESHOLD = 0.01
+_OWN_PID = os.getpid()
 
 # Keyed by exe path, not process name: two different apps can share an exe
 # name (rare) but never a path, and this avoids re-reading the same file's
@@ -66,6 +69,14 @@ def active_source_process() -> str | None:
     for session in AudioUtilities.GetAllSessions():
         if session.Process is None:
             continue  # system sounds session, not an app
+        if session.Process.pid == _OWN_PID:
+            # This app's own WASAPI *loopback capture* client shows up in
+            # GetAllSessions() alongside real playback sessions (it's
+            # opened against the same render endpoint it's tapping), and
+            # its peak meter mirrors whatever it's capturing -- so without
+            # this check, this app can end up "detecting" itself as the
+            # source of the very audio it's only listening in on.
+            continue
         try:
             meter = session._ctl.QueryInterface(IAudioMeterInformation)
             peak = meter.GetPeakValue()
