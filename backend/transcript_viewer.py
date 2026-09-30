@@ -2,8 +2,9 @@
 FastAPI app (already running on localhost:8000) -- mirrors log_viewer.py's
 pattern exactly: the SQLite file lives on the frontend's host filesystem
 (frontend/transcript_store.py, written natively outside Docker) and
-reaches this container read-only via the same kind of docker-compose bind
-mount already used for the frontend log file.
+reaches this container read-only via the same docker-compose bind mount
+already used for the frontend log file -- both live in the same host
+logs/frontend/ folder now, so it's one mount for both.
 
 Opens its own short-lived, explicitly read-only connection per request
 (mode=ro via a file: URI) rather than holding one open -- this container
@@ -20,7 +21,7 @@ from pathlib import Path
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse
 
-DB_PATH = Path("/app/frontend_data/transcripts.db")
+DB_PATH = Path("/app/frontend_logs/transcripts.db")
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 5000
 
@@ -133,7 +134,7 @@ _PAGE_HTML = """<!doctype html>
   <table id="tbl">
     <thead>
       <tr>
-        <th>Start</th><th>Duration</th><th>Auto</th><th>Src</th><th>Dst</th>
+        <th>Start</th><th>End</th><th>Duration</th><th>Auto</th><th>Src</th><th>Dst</th>
         <th>Source text</th><th>Translation</th><th>Host</th><th>Model</th><th>Size</th><th>Source app</th>
       </tr>
     </thead>
@@ -162,6 +163,13 @@ function esc(s) {
   div.textContent = s == null ? "" : String(s);
   return div.innerHTML;
 }
+// Shows the literal word "null" for a genuinely missing value (source_lang
+// on a non-auto-detect row, source_app when nothing was detected, etc.)
+// rather than a dash -- this view is a faithful look at the raw stored
+// data, not a stylized display, so null should read as null.
+function nullable(v) {
+  return v == null ? "null" : esc(v);
+}
 
 async function fetchRows() {
   statusEl.textContent = "Loading...";
@@ -183,16 +191,17 @@ async function fetchRows() {
         if (r.is_delayed) tr.className = "delayed";
         tr.innerHTML = `
           <td>${esc(fmtTime(r.start_ts))}</td>
+          <td>${esc(fmtTime(r.end_ts))}</td>
           <td>${esc(fmtDuration(r.start_ts, r.end_ts))}</td>
           <td>${r.auto_detect ? "yes" : "no"}</td>
-          <td>${esc(r.source_lang || "—")}</td>
-          <td>${esc(r.dest_lang || "—")}</td>
+          <td>${nullable(r.source_lang)}</td>
+          <td>${nullable(r.dest_lang)}</td>
           <td class="text-cell">${esc(r.source_text)}</td>
           <td class="text-cell">${esc(r.dest_text)}</td>
-          <td>${esc(r.host || "—")}</td>
-          <td>${esc(r.model || "—")}</td>
-          <td>${esc(r.size || "—")}</td>
-          <td>${esc(r.source_app || "—")}</td>`;
+          <td>${nullable(r.host)}</td>
+          <td>${nullable(r.model)}</td>
+          <td>${nullable(r.size)}</td>
+          <td>${nullable(r.source_app)}</td>`;
         bodyEl.appendChild(tr);
       }
     }
