@@ -18,10 +18,56 @@ REM you could be testing against week-old code with no indication. Docker
 REM layer caching makes an up-to-date build a fast no-op, and
 REM `up -d --build` only actually recreates the container when the image
 REM genuinely changed, so this stays cheap on the common case.
+REM The Docker engine must be up before compose can do anything. If Docker
+REM Desktop isn't running, `compose up` fails instantly and the old script
+REM then polled a backend that could never start for ~10 minutes. Start
+REM Docker Desktop ourselves and wait for the engine, failing fast otherwise.
+docker info >nul 2>&1
+if errorlevel 1 (
+    set "DOCKER_DESKTOP=%LOCALAPPDATA%\Programs\DockerDesktop\Docker Desktop.exe"
+    if not exist "!DOCKER_DESKTOP!" set "DOCKER_DESKTOP=%ProgramFiles%\Docker\Docker\Docker Desktop.exe"
+    if not exist "!DOCKER_DESKTOP!" (
+        echo Docker engine is not running and Docker Desktop was not found.
+        pause
+        exit /b 1
+    )
+    echo Docker engine not running -- starting Docker Desktop...
+    start "" "!DOCKER_DESKTOP!"
+    set "DOCKER_TRIES=0"
+    :dockerwait
+    timeout /t 3 /nobreak >nul
+    docker info >nul 2>&1
+    if not errorlevel 1 goto dockerready
+    set /a DOCKER_TRIES+=1
+    if !DOCKER_TRIES! GEQ 60 (
+        echo Docker engine did not start within ~3 minutes. Open Docker Desktop and check for errors.
+        pause
+        exit /b 1
+    )
+    goto dockerwait
+)
+:dockerready
+
 echo.
 echo Checking for backend updates and ensuring the container is running...
 echo.
+REM Right after Docker Desktop starts, `docker info` can succeed slightly
+REM before compose/buildx are usable, so retry a few times before giving up.
+set "COMPOSE_TRIES=0"
+:composeup
 docker compose -f "%COMPOSE_FILE%" up -d --build
+if not errorlevel 1 goto composedone
+set /a COMPOSE_TRIES+=1
+if !COMPOSE_TRIES! GEQ 5 (
+    echo.
+    echo docker compose failed -- see the error above.
+    pause
+    exit /b 1
+)
+echo docker compose failed, retrying in 10s ^(!COMPOSE_TRIES!/5^)...
+timeout /t 10 /nobreak >nul
+goto composeup
+:composedone
 
 for /f "delims=" %%A in ('curl -s -o nul -w "%%{http_code}" %BACKEND_URL% 2^>nul') do set "HEALTH_CODE=%%A"
 
