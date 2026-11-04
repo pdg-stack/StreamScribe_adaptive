@@ -456,19 +456,14 @@ class OverlayWindow(QWidget):
         self._current_tier = new_tier
         self._update_advanced_pane()
         if kind in ("partial", "final"):
-            # Full text, not just a length -- this is the raw text/
-            # translated_text exactly as received from the backend
-            # pipeline, before any of this file's own display logic
-            # (same-language collapsing, show_source_transcript,
-            # _shown_source_dest below) decides what actually gets
-            # rendered. The transcript history DB only ever stores the
-            # latter (see _record_caption_event/_shown_source_dest) --
-            # diffing a DB row against the matching line here is how a
-            # bug in the FE rendering path (as opposed to the ASR/
-            # translation engines themselves) would show up.
+            # Lengths only, not the text itself -- the transcript content
+            # is already persisted in transcripts.db (see
+            # _record_caption_event/_shown_source_dest), so it isn't
+            # duplicated into frontend.log.
             log.info(
-                "[Transcript] kind=%s cpu=%s tier=%s text=%r translated_text=%r",
-                kind, event.get("cpu_status"), new_tier, event.get("text", ""), event.get("translated_text", ""),
+                "[Transcript] kind=%s cpu=%s tier=%s text_len=%d translated_len=%d",
+                kind, event.get("cpu_status"), new_tier,
+                len(event.get("text", "")), len(event.get("translated_text", "")),
             )
 
         detected = event.get("detected_lang")
@@ -643,10 +638,7 @@ class OverlayWindow(QWidget):
         place _entry_paragraphs, _entry_plain_text, and the transcript-
         history DB write (_record_caption_event) all derive from, so what
         gets saved to the DB can never drift from what's actually on
-        screen -- the raw engine text/translated_text this decision is
-        made FROM is what the [Transcript] log line records instead (see
-        handle_event), so the two can be diffed against each other to
-        isolate a rendering-side bug from an engine-side one."""
+        screen."""
         if entry.get("marker") == "delayed":
             return "<delayed>", "<delayed>"
 
@@ -724,10 +716,7 @@ class OverlayWindow(QWidget):
                 None if self._is_auto_selected() else self.source_combo.currentData()
             )
             # What's actually shown, not the raw engine text/translated_text
-            # -- see _shown_source_dest's docstring. The raw values are what
-            # the [Transcript] log line above already recorded, so a diff
-            # between that log and this DB row is exactly how a FE
-            # rendering bug (vs. an ASR/translation engine one) would show up.
+            # -- see _shown_source_dest's docstring.
             shown_source, shown_dest = self._shown_source_dest(entry)
             self._queue_transcript_row(
                 is_delayed=False, start_ts=start_ts, end_ts=end_ts,
