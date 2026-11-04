@@ -11,13 +11,16 @@ echo ============================================================
 echo StreamScribe_adaptive -- starting up
 echo ============================================================
 
-REM Always build+recreate, not just when unhealthy: gating the build on a
-REM health check meant an already-running (but stale) container from a
-REM previous session would never pick up backend code changes at all --
-REM you could be testing against week-old code with no indication. Docker
-REM layer caching makes an up-to-date build a fast no-op, and
-REM `up -d --build` only actually recreates the container when the image
-REM genuinely changed, so this stays cheap on the common case.
+REM Lifecycle: the image is built only if it doesn't exist (or when this
+REM script is run with --rebuild, e.g. after changing backend code); models
+REM live in the separate shared-model-cache volume; the containers are
+REM started with the app and removed when it closes. The image and the
+REM volume are never deleted here.
+set "IMAGE_NAME=streamscribe_adaptive-backend:latest"
+set "MODEL_VOLUME=shared-model-cache"
+set "BUILD_FLAG="
+if /i "%~1"=="--rebuild" set "BUILD_FLAG=--build"
+
 REM The Docker engine must be up before compose can do anything. If Docker
 REM Desktop isn't running, `compose up` fails instantly and the old script
 REM then polled a backend that could never start for ~10 minutes. Start
@@ -48,14 +51,28 @@ if errorlevel 1 (
 )
 :dockerready
 
-echo.
-echo Checking for backend updates and ensuring the container is running...
+docker volume inspect %MODEL_VOLUME% >nul 2>&1
+if errorlevel 1 (
+    echo Creating model volume "%MODEL_VOLUME%" ^(models download into it on first run^)...
+    docker volume create %MODEL_VOLUME% >nul
+)
+
+docker image inspect %IMAGE_NAME% >nul 2>&1
+if errorlevel 1 (
+    echo Backend image not found -- building it ^(first run only, this takes a while^)...
+) else if defined BUILD_FLAG (
+    echo Rebuilding the backend image...
+) else (
+    echo Backend image found -- skipping build.
+)
 echo.
 REM Right after Docker Desktop starts, `docker info` can succeed slightly
 REM before compose/buildx are usable, so retry a few times before giving up.
 set "COMPOSE_TRIES=0"
 :composeup
-docker compose -f "%COMPOSE_FILE%" up -d --build
+REM No --build unless requested: compose still builds on its own when the
+REM image is missing, and reuses it otherwise.
+docker compose -f "%COMPOSE_FILE%" up -d %BUILD_FLAG%
 if not errorlevel 1 goto composedone
 set /a COMPOSE_TRIES+=1
 if !COMPOSE_TRIES! GEQ 5 (
@@ -107,4 +124,9 @@ echo Backend ready.
 echo ------------------------------------------------------------
 cd /d "%REPO_DIR%"
 "%PYTHON_EXE%" -m frontend.main
-pause
+set "APP_EXIT=%errorlevel%"
+
+echo.
+echo App closed -- stopping and removing the containers ^(image and model volume are kept^)...
+docker compose -f "%COMPOSE_FILE%" down
+if not "!APP_EXIT!"=="0" pause
