@@ -6,13 +6,19 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - D:/Work/Docker/shared-model-cache:/root/.cache
+      # Named volume, independent of this image/container: models download
+      # once into it and survive image rebuilds and container removal, and
+      # any other image can mount the same volume. External, so compose
+      # never deletes it -- frontend/launch.bat creates it if missing.
+      - model-cache:/root/.cache
       - ./logs/backend:/app/logs
       # frontend.log and transcripts.db both live here now (see
       # frontend/logging_config.py and frontend/transcript_store.py) --
       # one read-only mount covers both.
       - ./logs/frontend:/app/frontend_logs:ro
-    restart: unless-stopped
+    # launch.bat starts the containers with the app and removes them when it
+    # closes, so nothing should auto-restart them in between.
+    restart: "no"
 
   # Live container-log viewer (search, level highlighting, tail) for the
   # backend's stdout -- lighter than a full Grafana/Loki stack. Only shows
@@ -25,4 +31,9 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    restart: unless-stopped
+    restart: "no"
+
+volumes:
+  model-cache:
+    external: true
+    name: shared-model-cache
